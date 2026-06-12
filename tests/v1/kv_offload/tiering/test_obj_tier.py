@@ -10,6 +10,7 @@ state machine: job submission, transfer completion polling, and lookup.
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -145,6 +146,8 @@ class MockNixlAgent:
         self._pending: dict[int, tuple[str, list[str]]] = {}
         self._handle_counter = 0
         self._last_obj_keys: list[str] = []
+        # Recorded DRAM registrations as (addr, len) tuples.
+        self.dram_regs: list[tuple[int, int]] = []
         # Bind default implementations as instance attributes.
         self.register_memory = self._register_memory
         self.make_prepped_xfer = self._make_prepped_xfer
@@ -160,6 +163,9 @@ class MockNixlAgent:
         # Capture obj_keys from OBJ 4-tuples: (addr, len, dev_id, obj_key)
         if mem_type == "OBJ" and descs:
             self._last_obj_keys = [d[3] for d in descs if d[3]]
+        # Record DRAM registrations as (addr, len) for chunking assertions.
+        if mem_type == "DRAM" and descs:
+            self.dram_regs.extend((d[0], d[1]) for d in descs)
         return mock
 
     def deregister_memory(self, desc):
@@ -230,6 +236,7 @@ def _make_tier(
     offloading_spec: SimpleNamespace = _OFFLOADING_SPEC,
     primary_kv_view: memoryview | None = None,
     store_config: dict | None = None,
+    max_reg_bytes: int | None = None,
     **tier_kwargs,
 ) -> tuple[ObjectStoreSecondaryTierManager, MockNixlAgent]:
     """Create a tier backed by a fresh MockNixlAgent."""
@@ -237,13 +244,23 @@ def _make_tier(
     if primary_kv_view is None:
         tensor = torch.zeros((num_blocks, _BLOCK_ELEMENTS), dtype=_DTYPE)
         primary_kv_view = memoryview(tensor.numpy())
-    with (
+    ctx = [
         patch("vllm.v1.kv_offload.tiering.obj.manager.nixl_agent_config"),
         patch(
             "vllm.v1.kv_offload.tiering.obj.manager.nixl_agent",
             return_value=mock_agent,
         ),
-    ):
+    ]
+    if max_reg_bytes is not None:
+        ctx.append(
+            patch(
+                "vllm.v1.kv_offload.tiering.obj.manager.MAX_REG_BYTES",
+                max_reg_bytes,
+            )
+        )
+    with ExitStack() as stack:
+        for cm in ctx:
+            stack.enter_context(cm)
         tier = ObjectStoreSecondaryTierManager(
             offloading_spec=offloading_spec,
             primary_kv_view=primary_kv_view,
@@ -596,7 +613,7 @@ class TestMockObjTierShutdown:
         tier.shutdown()
         assert len(tier._transfers) == 0
         assert tier._dram_prepped_handle is None
-        assert tier._primary_reg is None
+        assert tier._primary_regs == []
 
     def test_shutdown_idempotent(self):
         tier, _ = _make_tier(num_blocks=4)
@@ -725,6 +742,9 @@ _ACCEL_STORE_CONFIG = {
     "type": "scality_ai_connector",
     "endpoint_override": "http://10.0.0.1:10000",
 }
+
+# Bytes per block in the test fixtures: _BLOCK_ELEMENTS float32 elements.
+_STRIDE = _BLOCK_ELEMENTS * 4
 
 
 class TestObjStoreConfig:
@@ -879,6 +899,59 @@ def test_obj_tier_replicated_layout_collapses_mapper_identity():
     finally:
         tp2_tier.shutdown()
         tp4_tier.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Chunked DRAM registration
+# ---------------------------------------------------------------------------
+
+
+class TestObjTierChunkedRegistration:
+    def test_single_chunk_under_limit(self):
+        tier, agent = _make_tier(num_blocks=4)
+        # Whole buffer fits in one registration under the default 4 GiB cap.
+        assert len(agent.dram_regs) == 1
+        assert agent.dram_regs[0][1] == 4 * _STRIDE
+        assert len(tier._primary_regs) == 1
+
+    def test_multiple_chunks_block_aligned(self):
+        # 2048-byte cap with 1024-byte blocks => 2 blocks per chunk.
+        tier, agent = _make_tier(num_blocks=8, max_reg_bytes=2 * _STRIDE)
+        regs = agent.dram_regs
+        assert len(regs) == 4
+        # Each chunk is <= cap and a whole multiple of the block stride.
+        for _, length in regs:
+            assert length <= 2 * _STRIDE
+            assert length % _STRIDE == 0
+        # Chunks are contiguous and exactly cover the whole buffer.
+        base = regs[0][0]
+        offset = 0
+        for addr, length in regs:
+            assert addr == base + offset
+            offset += length
+        assert offset == 8 * _STRIDE
+        assert len(tier._primary_regs) == 4
+
+    def test_roundtrip_across_chunk_boundary(self):
+        tier, _ = _make_tier(num_blocks=8, max_reg_bytes=2 * _STRIDE)
+        keys = [key(i) for i in range(8)]
+        tier.submit_store(make_job(1, keys, list(range(8))))
+        results = drain(tier)
+        assert len(results) == 1 and results[0].success
+        tier.submit_load(make_job(2, keys, list(range(8))))
+        results = drain(tier)
+        assert len(results) == 1 and results[0].success
+        assert lookup_and_wait(tier, keys) == [True] * 8
+
+    def test_block_larger_than_max_raises(self):
+        with pytest.raises(RuntimeError, match="block size"):
+            _make_tier(num_blocks=4, max_reg_bytes=_STRIDE // 2)
+
+    def test_shutdown_deregisters_all_chunks(self):
+        tier, agent = _make_tier(num_blocks=8, max_reg_bytes=2 * _STRIDE)
+        assert len(tier._primary_regs) == 4
+        tier.shutdown()
+        assert tier._primary_regs == []
 
 
 class TestObjTierAccelerated:
