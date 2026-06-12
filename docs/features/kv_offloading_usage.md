@@ -119,6 +119,68 @@ To enable KV cache sharing between multiple vLLM instances using the same `root_
 PYTHONHASHSEED=0 vllm serve ...
 ```
 
+### Object Store (OBJ)
+
+The object store tier (`type: "obj"`) offloads blocks to an S3-compatible store via NIXL's OBJ plugin. Each entry takes a nested `store_config` dict (the backend connection parameters) plus the tier-level keys below.
+
+| Key | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `type` | yes | — | Must be `obj`. |
+| `store_config` | yes | — | Backend connection params (see below). |
+| `prefix` | no | `""` | Object key prefix; keys are `{prefix}/{hash_shard}/{hash}.bin`. |
+| `io_threads` | no | `4` | NIXL backend worker threads (passed as `num_threads`). |
+
+The OBJ tier supports two engine modes, selected inside `store_config`:
+
+**Default S3 engine** (HTTP(S), host-staged) — the default when `accelerated` is unset:
+
+| `store_config` key | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `bucket` | yes | — | S3 bucket name. |
+| `endpoint_override` | yes | — | S3 endpoint URL. |
+| `access_key` | yes | — | S3 access key ID. |
+| `secret_key` | yes | — | S3 secret access key. |
+| `scheme` | no | `http` | `http` or `https`. |
+| `ca_bundle` | no | `""` | Path to a custom CA bundle. |
+
+**Accelerated engine** (cuObject/GPUDirect RDMA, e.g. the Scality AI Connector or Dell ObjectScale):
+
+| `store_config` key | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `accelerated` | yes | `false` | Set to `true` to select an accelerated NIXL OBJ engine. |
+| `type` | yes | — | Engine type, e.g. `scality_ai_connector` or `dell`. |
+| `endpoint_override` | yes | — | Connector base URL, e.g. `http://10.0.0.1:81`. |
+| `extra_params` | no | `{}` | Engine-specific NIXL params (advanced pass-through). |
+
+Accelerated mode does not use `bucket`/`access_key`/`secret_key`/`scheme`; supplying them is rejected.
+
+```json
+{
+  "kv_connector": "OffloadingConnector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {
+    "spec_name": "TieringOffloadingSpec",
+    "cpu_bytes_to_use": 10737418240,
+    "block_size": 16,
+    "eviction_policy": "lru",
+    "secondary_tiers": [
+      {
+        "type": "obj",
+        "prefix": "vllm-kv",
+        "io_threads": 8,
+        "store_config": {
+          "accelerated": true,
+          "type": "scality_ai_connector",
+          "endpoint_override": "http://10.0.0.1:81"
+        }
+      }
+    ]
+  }
+}
+```
+
+Accelerated engines require NIXL's OBJ plugin built with cuObject/GPUDirect Storage and an RDMA-capable fabric reachable by the endpoint; the offload path stays CPU-staged (GPU↔CPU↔store).
+
 ## Tuning Tips
 
 - `cpu_bytes_to_use`: a bigger CPU tier means fewer trips to slower secondary tiers and a higher hit rate. The value is total across all workers, not per-worker. Leave headroom for the rest of the host workload.

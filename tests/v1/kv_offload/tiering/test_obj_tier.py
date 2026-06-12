@@ -15,10 +15,12 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 import torch
 
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext, make_offload_key
 from vllm.v1.kv_offload.tiering.base import JobMetadata, JobResult
+from vllm.v1.kv_offload.tiering.obj.config import ObjStoreConfig
 from vllm.v1.kv_offload.tiering.obj.manager import ObjectStoreSecondaryTierManager
 
 # ---------------------------------------------------------------------------
@@ -173,6 +175,7 @@ class MockNixlAgent:
 
 def _make_tier(
     num_blocks: int = 4,
+    store_config: dict | None = None,
 ) -> tuple[ObjectStoreSecondaryTierManager, MockNixlAgent]:
     """Create a tier backed by a fresh MockNixlAgent."""
     mock_agent = MockNixlAgent()
@@ -189,7 +192,7 @@ def _make_tier(
             offloading_spec=_OFFLOADING_SPEC,
             primary_kv_view=view,
             tier_type="obj",
-            store_config=_STORE_CONFIG,
+            store_config=store_config or _STORE_CONFIG,
             prefix=_RUN_PREFIX,
         )
     return tier, mock_agent
@@ -380,3 +383,96 @@ class TestMockObjTierShutdown:
         tier, _ = _make_tier(num_blocks=4)
         tier.shutdown()
         tier.shutdown()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# ObjStoreConfig validation
+# ---------------------------------------------------------------------------
+
+_ACCEL_STORE_CONFIG = {
+    "accelerated": True,
+    "type": "scality_ai_connector",
+    "endpoint_override": "http://10.0.0.1:10000",
+}
+
+
+class TestObjStoreConfig:
+    def test_s3_to_nixl_params(self):
+        cfg = ObjStoreConfig(**_STORE_CONFIG)
+        params = cfg.to_nixl_params()
+        assert params == {
+            "bucket": "mock-bucket",
+            "endpoint_override": "mock:9000",
+            "scheme": "http",
+            "access_key": "mock-access",
+            "secret_key": "mock-secret",
+        }
+
+    def test_s3_missing_required_raises(self):
+        with pytest.raises(ValueError, match="bucket"):
+            ObjStoreConfig(
+                endpoint_override="mock:9000", access_key="a", secret_key="b"
+            )
+
+    def test_missing_endpoint_raises(self):
+        with pytest.raises(ValueError, match="endpoint_override"):
+            ObjStoreConfig(
+                endpoint_override="",
+                bucket="b",
+                access_key="a",
+                secret_key="s",
+            )
+
+    def test_accelerated_to_nixl_params(self):
+        cfg = ObjStoreConfig(**_ACCEL_STORE_CONFIG)
+        assert cfg.accelerated is True
+        assert cfg.to_nixl_params() == {
+            "accelerated": "true",
+            "type": "scality_ai_connector",
+            "endpoint_override": "http://10.0.0.1:81",
+        }
+
+    def test_accelerated_extra_params_passthrough(self):
+        cfg = ObjStoreConfig(
+            **_ACCEL_STORE_CONFIG, extra_params={"req_checksum": "required"}
+        )
+        params = cfg.to_nixl_params()
+        assert params["req_checksum"] == "required"
+        assert "bucket" not in params and "access_key" not in params
+
+    def test_accelerated_string_bool_normalization(self):
+        cfg = ObjStoreConfig(
+            accelerated="true",
+            type="dell",
+            endpoint_override="http://x:1",
+        )
+        assert cfg.accelerated is True
+        assert cfg.to_nixl_params()["type"] == "dell"
+
+    def test_accelerated_missing_type_raises(self):
+        with pytest.raises(ValueError, match="type"):
+            ObjStoreConfig(accelerated=True, endpoint_override="http://x:1")
+
+    def test_accelerated_mixed_mode_raises(self):
+        with pytest.raises(ValueError, match="S3-only"):
+            ObjStoreConfig(
+                accelerated=True,
+                type="scality_ai_connector",
+                endpoint_override="http://x:1",
+                bucket="b",
+            )
+
+    def test_accelerated_reserved_extra_param_raises(self):
+        with pytest.raises(ValueError, match="reserved"):
+            ObjStoreConfig(
+                accelerated=True,
+                type="scality_ai_connector",
+                endpoint_override="http://x:1",
+                extra_params={"num_threads": "8"},
+            )
+
+
+class TestObjTierAccelerated:
+    def test_accelerated_tier_created(self):
+        tier, _ = _make_tier(num_blocks=4, store_config=_ACCEL_STORE_CONFIG)
+        assert tier._is_accelerated is True
