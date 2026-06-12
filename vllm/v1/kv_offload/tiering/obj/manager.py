@@ -158,6 +158,7 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         agent_config = nixl_agent_config(backends=[])
         self._agent = nixl_agent("ObjAgent", agent_config)
         obj_config = ObjStoreConfig(**store_config)
+        self._is_accelerated = obj_config.accelerated
         params = {**obj_config.to_nixl_params(), "num_threads": str(io_threads)}
         self._agent.create_backend("OBJ", params)
         self._transfers: dict[int, TransferEntry] = {}
@@ -206,16 +207,22 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         an exception indicates misconfigured obj store params and raises RuntimeError.
         """
         probe_key = "__nixl_probe__/connectivity_test"
+        if self._is_accelerated:
+            hint = "type and endpoint_override"
+        else:
+            hint = (
+                "bucket, endpoint_override, and scheme. If using explicit "
+                "credentials verify access_key and secret_key; otherwise ensure "
+                "the AWS SDK default credential chain is configured (IAM role, "
+                "env vars, credential file)"
+            )
         try:
             self._exists(probe_key)
             logger.info("Object store tier connectivity probe succeeded")
         except Exception as e:
             raise RuntimeError(
-                f"Object store tier connectivity probe failed — check bucket, "
-                f"endpoint_override, and scheme. If using explicit credentials "
-                f"verify access_key and secret_key; otherwise ensure the AWS "
-                f"SDK default credential chain is configured (IAM role, env "
-                f"vars, credential file). Error: {e}"
+                f"Object store tier connectivity probe failed — check {hint}. "
+                f"Error: {e}"
             ) from e
 
     def _exists(self, obj_key: str) -> bool:
