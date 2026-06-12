@@ -206,7 +206,9 @@ The object-store tier (`type: "obj"`) offloads blocks to an S3-compatible object
 | `enable_kv_events` | no | `false` | Publish `BlockStored` KV events (medium `STORAGE`) for successfully stored blocks. Requires KV cache events to be enabled globally. |
 | `locality` | no | unspecified | `LOCAL` or `REMOTE` relative to the publishing vLLM instance. Included in the tier's KV events only when explicitly configured. |
 
-`store_config` fields:
+The OBJ tier supports two engine modes, selected inside `store_config`:
+
+**Default S3 engine** (HTTP(S), host-staged) — the default when `accelerated` is unset:
 
 | Key | Required | Default | Notes |
 | --- | --- | --- | --- |
@@ -216,6 +218,44 @@ The object-store tier (`type: "obj"`) offloads blocks to an S3-compatible object
 | `access_key`, `secret_key`, `session_token` | no | `""` | Explicit credentials. When left empty, the NIXL OBJ plugin falls back to the AWS SDK default credential provider chain (IAM roles, environment variables, credential files), which enables workload-identity auth on Kubernetes. |
 | `region` | no | `""` | Bucket region, if the endpoint requires one. |
 | `ca_bundle` | no | `""` | CA bundle path for TLS verification. |
+
+**Accelerated engine** (cuObject/GPUDirect RDMA, e.g. the Scality AI Connector or Dell ObjectScale):
+
+| `store_config` key | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `accelerated` | yes | `false` | Set to `true` to select an accelerated NIXL OBJ engine. |
+| `type` | yes | — | Engine type, e.g. `scality_ai_connector` or `dell`. |
+| `endpoint_override` | yes | — | Connector base URL, e.g. `http://10.0.0.1:81`. |
+| `extra_params` | no | `{}` | Engine-specific NIXL params (advanced pass-through). |
+
+Accelerated mode does not use `bucket`/`access_key`/`secret_key`/`scheme`; supplying them is rejected.
+
+```json
+{
+  "kv_connector": "OffloadingConnector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {
+    "spec_name": "TieringOffloadingSpec",
+    "cpu_bytes_to_use": 10737418240,
+    "block_size": 16,
+    "eviction_policy": "lru",
+    "secondary_tiers": [
+      {
+        "type": "obj",
+        "prefix": "vllm-kv",
+        "io_threads": 8,
+        "store_config": {
+          "accelerated": true,
+          "type": "scality_ai_connector",
+          "endpoint_override": "http://10.0.0.1:81"
+        }
+      }
+    ]
+  }
+}
+```
+
+Accelerated engines require NIXL's OBJ plugin built with cuObject/GPUDirect Storage and an RDMA-capable fabric reachable by the endpoint; the offload path stays CPU-staged (GPU↔CPU↔store).
 
 Object keys follow the same run-configuration digest scheme as the filesystem tier (see [On-Disk Layout](#on-disk-layout)) and are stored under the optional `prefix`. The [Cross-Process Sharing](#cross-process-sharing) behavior applies to shared buckets as well, so instances sharing a bucket produce identical keys for identical content; set a shared `PYTHONHASHSEED` if you want a custom seed. At startup the tier probes object store connectivity and fails fast with a configuration error if the bucket is unreachable.
 

@@ -158,6 +158,7 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         agent_config = nixl_agent_config(backends=[])
         self._agent = nixl_agent("ObjAgent", agent_config)
         obj_config = ObjStoreConfig(**store_config)
+        self._is_accelerated = obj_config.accelerated
         params = {**obj_config.to_nixl_params(), "num_threads": str(io_threads)}
         self._agent.create_backend("OBJ", params)
         self._transfers: dict[int, TransferEntry] = {}
