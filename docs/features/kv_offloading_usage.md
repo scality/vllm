@@ -179,7 +179,7 @@ Accelerated mode does not use `bucket`/`access_key`/`secret_key`/`scheme`; suppl
 }
 ```
 
-Accelerated engines require NIXL's OBJ plugin built with cuObject/GPUDirect Storage and an RDMA-capable fabric reachable by the endpoint; the offload path stays CPU-staged (GPU↔CPU↔store).
+Accelerated engines require NIXL's OBJ plugin built with cuObject/GPUDirect Storage and an RDMA-capable fabric reachable by the endpoint. cuObject caps a single memory registration at 4 GiB, so vLLM registers the CPU buffer in chunks aligned to block boundaries; the offload path stays CPU-staged (GPU↔CPU↔store). `block_size` must not exceed 4 GiB.
 
 ## Tuning Tips
 
