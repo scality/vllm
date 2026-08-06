@@ -381,9 +381,13 @@ class OffloadingConnectorScheduler:
             result = self.manager.lookup(keys[idx], req_context)
             if result is None:
                 defer_lookup = True
-                # continue lookup to allow manager to kick-off async lookups
-                # for all blocks (until a hit is detected)
-                result = False
+                # A promotion was just kicked off, so this block WILL become
+                # resident. Counting it as a miss resets consecutive_hits and
+                # defeats the sliding-window bound on the first pass -- the only
+                # pass that issues fetches -- turning a 4-block window into a
+                # full-range scan and one fetch per block. Both return paths
+                # still gate on `not defer_lookup`, so the request retries.
+                result = True
             if not result:
                 consecutive_hits = 0
             else:
