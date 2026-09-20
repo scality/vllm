@@ -357,6 +357,8 @@ class RequestOffloadState:
     max_offload_tokens: int | None = None
     # number of hits in the GPU cache
     num_locally_computed_tokens: int = 0
+    # True once the GPU-local prefix has been recorded for this request.
+    gpu_prefix_access_recorded: bool = False
     # In-flight job IDs. Per the connector's invariant, at any given time
     # this contains either a single load job, or one or more store jobs.
     transfer_jobs: set[int] = field(default_factory=set)
@@ -1512,6 +1514,9 @@ class OffloadingConnectorScheduler:
                 block.block_id for block in group_blocks if block.block_id != 0
             )
 
+        req_status = self._req_status[request.request_id]
+        self._record_gpu_local_prefix_access(req_status)
+
         if num_external_tokens == 0:
             return
 
@@ -1519,7 +1524,6 @@ class OffloadingConnectorScheduler:
         # already saw as HIT, so both must sit inside the same region.
         self._acquire_step()
 
-        req_status = self._req_status[request.request_id]
         req_status.loaded_from_offload = True
         sync_load = request.request_id in self._current_batch_sync_loads
 
@@ -1651,6 +1655,43 @@ class OffloadingConnectorScheduler:
         if self._chunks_being_loaded is not None and not sync_load:
             self._chunks_being_loaded.update(keys_to_load)
         req_status.partial_tail_boundary = None
+
+    def _record_gpu_local_prefix_access(self, req_status: RequestOffloadState) -> None:
+        """Record offload keys represented by the GPU-local prefix.
+
+        A GPU prefix hit bypasses ``lookup`` and ``prepare_load``. Feed only
+        the retained local chunks to the request-scoped access tracker; the
+        manager filters keys it does not own or that are not ready.
+        """
+        local_tokens = req_status.num_locally_computed_tokens
+        if local_tokens == 0 or req_status.gpu_prefix_access_recorded:
+            return
+
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            offload_keys = group_state.offload_keys
+            num_local_chunks = min(
+                len(offload_keys),
+                local_tokens // group_config.tokens_per_chunk,
+            )
+            num_hit_chunks = min(len(offload_keys), group_state.num_hit_chunks)
+            local_end = min(num_local_chunks, num_hit_chunks)
+            if group_config.sliding_window_size_in_chunks is not None:
+                local_start = max(
+                    0,
+                    num_hit_chunks - group_config.sliding_window_size_in_chunks,
+                )
+            else:
+                local_start = 0
+            if local_start >= local_end:
+                continue
+            self._acquire_step()
+            self.manager.record_access(
+                offload_keys[local_start:local_end],
+                req_status.req_context,
+            )
+        req_status.gpu_prefix_access_recorded = True
 
     def _update_req_states(self, scheduler_output: SchedulerOutput) -> None:
         """Update request states from the Scheduler's output."""

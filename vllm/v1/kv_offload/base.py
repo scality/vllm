@@ -225,6 +225,9 @@ The class provides the following primitives:
         The given blocks will be protected from eviction.
         This function returns a LoadSpec which encapsulates
         information required for performing the load.
+    record_access() - records a request-scoped access to ready offloaded
+        blocks without pinning or transferring them. This is used for blocks
+        that are already cached by the GPU prefix cache.
     complete_load() - mark blocks which were previously prepared to be
         loaded as done loading. This is to re-allow their eviction.
     prepare_store() - prepare the given blocks to be written.
@@ -381,6 +384,22 @@ class OffloadingManager(ABC):
 
         """
         pass
+
+    def record_access(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        """Record a request-scoped access without pinning or transferring.
+
+        Managers should ignore keys that are not ready in the offload cache.
+        The access is finalized by :meth:`on_request_finished`, together with
+        accesses observed through ``prepare_load`` and ``prepare_store``.
+
+        Args:
+            keys: Candidate keys observed in the GPU-local prefix.
+            req_context: Per-request context.
+
+        """
+        return
 
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
         """Marks previous blocks that were prepared to load as done loading.
