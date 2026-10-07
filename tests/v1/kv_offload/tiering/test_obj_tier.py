@@ -942,7 +942,7 @@ class TestObjTierChunkedRegistration:
         tier.submit_load(make_job(2, keys, list(range(8))))
         results = drain(tier)
         assert len(results) == 1 and results[0].success
-        assert lookup_and_wait(tier, keys) == [True] * 8
+        assert lookup_and_wait(tier, keys) == [LookupResult.HIT] * 8
 
     def test_block_larger_than_max_raises(self):
         with pytest.raises(RuntimeError, match="block size"):
