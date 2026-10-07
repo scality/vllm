@@ -740,7 +740,7 @@ class TestObjTierKVEvents:
 _ACCEL_STORE_CONFIG = {
     "accelerated": True,
     "type": "scality_ai_connector",
-    "endpoint_override": "http://10.0.0.1:10000",
+    "endpoint_override": "http://10.0.0.1:81",
 }
 
 # Bytes per block in the test fixtures: _BLOCK_ELEMENTS float32 elements.
