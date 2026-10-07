@@ -848,13 +848,14 @@ class TestObjStoreConfig:
         with pytest.raises(ValueError, match="type"):
             ObjStoreConfig(accelerated=True, endpoint_override="http://x:1")
 
-    def test_accelerated_mixed_mode_raises(self):
-        with pytest.raises(ValueError, match="S3-only"):
+    @pytest.mark.parametrize("s3_field", ["bucket", "session_token", "region"])
+    def test_accelerated_mixed_mode_raises(self, s3_field):
+        with pytest.raises(ValueError, match=f"S3-only fields: {s3_field}"):
             ObjStoreConfig(
                 accelerated=True,
                 type="scality_ai_connector",
                 endpoint_override="http://x:1",
-                bucket="b",
+                **{s3_field: "b"},
             )
 
     def test_accelerated_reserved_extra_param_raises(self):

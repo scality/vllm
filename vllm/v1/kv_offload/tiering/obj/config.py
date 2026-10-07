@@ -13,7 +13,7 @@ _RESERVED_ACCELERATED_PARAMS = frozenset(
 
 # S3-only params that are meaningless to an accelerated engine. Supplying any
 # of them alongside ``accelerated`` indicates a mixed-mode config.
-_S3_ONLY_FIELDS = ("bucket", "access_key", "secret_key")
+_S3_ONLY_FIELDS = ("bucket", "access_key", "secret_key", "session_token", "region")
 
 
 def _is_truthy(value: object) -> bool:
@@ -32,16 +32,16 @@ class ObjStoreConfig:
     Two modes are supported:
 
     - **S3 mode** (default): drives NIXL's default AWS-SDK S3 engine over
-      HTTP(S). Requires ``bucket``, ``endpoint_override``, ``access_key`` and
-      ``secret_key``. When ``access_key`` and ``secret_key`` are left empty
-      the NIXL OBJ plugin falls back to the AWS SDK default credential
-      provider chain (IAM roles, environment variables, credential files,
-      etc.), which enables workload-identity based auth on Kubernetes.
+      HTTP(S). Requires ``bucket`` and ``endpoint_override``. When
+      ``access_key`` and ``secret_key`` are left empty the NIXL OBJ plugin
+      falls back to the AWS SDK default credential provider chain (IAM roles,
+      environment variables, credential files, etc.), which enables
+      workload-identity based auth on Kubernetes.
     - **Accelerated mode** (``accelerated=true``): selects a NIXL accelerated
       OBJ engine (e.g. ``scality_ai_connector``, ``dell``) that moves bytes
       over cuObject/GPUDirect RDMA. Requires ``type`` and ``endpoint_override``;
-      ``bucket``/``access_key``/``secret_key``/``scheme`` are not used.
-      Engine-specific params may be passed through ``extra_params``.
+      the S3 bucket and credential fields are rejected. Engine-specific params
+      may be passed through ``extra_params``.
     """
 
     endpoint_override: str
@@ -88,13 +88,10 @@ class ObjStoreConfig:
             )
 
     def _validate_s3(self) -> None:
-        missing = [
-            f for f in ("bucket", "access_key", "secret_key") if not getattr(self, f)
-        ]
-        if missing:
+        if not self.bucket:
             raise ValueError(
-                f"S3 object store tier requires: {', '.join(missing)}. "
-                f"For an accelerated engine, set 'accelerated': true and 'type'."
+                "S3 object store tier requires 'bucket'. For an accelerated "
+                "engine, set 'accelerated': true and 'type'."
             )
 
     def to_nixl_params(self) -> dict[str, str]:

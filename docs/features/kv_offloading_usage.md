@@ -228,7 +228,7 @@ The OBJ tier supports two engine modes, selected inside `store_config`:
 | `endpoint_override` | yes | — | Connector base URL, e.g. `http://10.0.0.1:81`. |
 | `extra_params` | no | `{}` | Engine-specific NIXL params (advanced pass-through). |
 
-Accelerated mode does not use `bucket`/`access_key`/`secret_key`/`scheme`; supplying them is rejected.
+Accelerated mode rejects the S3 bucket and credential fields (`bucket`, `access_key`, `secret_key`, `session_token`, `region`).
 
 ```json
 {
