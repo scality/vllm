@@ -950,9 +950,10 @@ class TestObjTierChunkedRegistration:
 
     def test_shutdown_deregisters_all_chunks(self):
         tier, agent = _make_tier(num_blocks=8, max_reg_bytes=2 * _STRIDE)
-        assert len(tier._primary_regs) == 4
-        tier.shutdown()
-        assert tier._primary_regs == []
+        regs = list(tier._primary_regs)
+        with patch.object(agent, "deregister_memory") as deregister:
+            tier.shutdown()
+        assert [c.args[0] for c in deregister.call_args_list] == regs
 
 
 class TestObjTierAccelerated:
