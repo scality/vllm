@@ -945,7 +945,7 @@ class TestObjTierChunkedRegistration:
         assert lookup_and_wait(tier, keys) == [LookupResult.HIT] * 8
 
     def test_block_larger_than_max_raises(self):
-        with pytest.raises(RuntimeError, match="block size"):
+        with pytest.raises(RuntimeError, match="offloaded KV chunk"):
             _make_tier(num_blocks=4, max_reg_bytes=_STRIDE // 2)
 
     def test_shutdown_deregisters_all_chunks(self):

@@ -255,7 +255,7 @@ Accelerated mode rejects the S3 bucket and credential fields (`bucket`, `access_
 }
 ```
 
-Accelerated engines require NIXL's OBJ plugin built with cuObject/GPUDirect Storage and an RDMA-capable fabric reachable by the endpoint. cuObject caps a single memory registration at 4 GiB, so vLLM registers the CPU buffer in chunks aligned to block boundaries; the offload path stays CPU-staged (GPU↔CPU↔store). `block_size` must not exceed 4 GiB.
+Accelerated engines require NIXL's OBJ plugin built with cuObject/GPUDirect Storage and an RDMA-capable fabric reachable by the endpoint. cuObject caps a single memory registration at 4 GiB, so vLLM registers the CPU buffer in chunks aligned to block boundaries; the offload path stays CPU-staged (GPU↔CPU↔store). One offloaded chunk, the KV cache of `block_size` tokens for every worker sharing the CPU buffer, must fit in 4 GiB.
 
 Object keys follow the same run-configuration digest scheme as the filesystem tier (see [On-Disk Layout](#on-disk-layout)) and are stored under the optional `prefix`. The [Cross-Process Sharing](#cross-process-sharing) behavior applies to shared buckets as well, so instances sharing a bucket produce identical keys for identical content; set a shared `PYTHONHASHSEED` if you want a custom seed. At startup the tier probes object store connectivity and fails fast with a configuration error if the bucket is unreachable.
 

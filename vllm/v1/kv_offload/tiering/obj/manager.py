@@ -195,7 +195,7 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         # covered by a single registration).
         if stride > MAX_REG_BYTES:
             raise RuntimeError(
-                f"KV block size ({stride} bytes) exceeds the maximum NIXL "
+                f"An offloaded KV chunk ({stride} bytes) exceeds the maximum NIXL "
                 f"registration size ({MAX_REG_BYTES} bytes). Reduce block_size."
             )
         blocks_per_chunk = MAX_REG_BYTES // stride
