@@ -49,6 +49,12 @@ NIXL_DONE = "DONE"
 # the device ID is always 0.
 NIXL_DEV_ID: int = 0
 
+# Maximum size of a single NIXL memory registration. cuObject (used by the
+# accelerated OBJ engines) rejects any registration larger than 4 GiB, so the
+# primary CPU buffer is registered in chunks aligned to block boundaries. The
+# default S3 engine has no such limit but tolerates the chunked registrations.
+MAX_REG_BYTES: int = 4 * 1024**3
+
 # Fields for NIXL OBJ descriptors: (addr, len, dev_id, obj_key).
 # For existence probes addr and len are placeholders — no data is read.
 # dev_id=0 is reserved for probes; transfers start from 1.
@@ -158,6 +164,7 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         agent_config = nixl_agent_config(backends=[])
         self._agent = nixl_agent("ObjAgent", agent_config)
         obj_config = ObjStoreConfig(**store_config)
+        self._is_accelerated = obj_config.accelerated
         params = {**obj_config.to_nixl_params(), "num_threads": str(io_threads)}
         self._agent.create_backend("OBJ", params)
         self._transfers: dict[int, TransferEntry] = {}
@@ -165,7 +172,7 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         # submission-time failures + poll-time completions accumulated
         # during drain_jobs().
         self._pending_results: list[JobResult] = []
-        self._primary_reg = None
+        self._primary_regs: list = []
         self._block_size_bytes: int = 0
         root_dir = f"{prefix}/" if prefix else ""
         # Opt in; FileMapper enables it only for a parallelism-invariant block.
@@ -179,13 +186,30 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         base_addr = ctypes.addressof(ctypes.c_char.from_buffer(primary_kv_view))
         assert primary_kv_view.strides is not None
         stride = primary_kv_view.strides[0]
-        self._primary_reg = self._agent.register_memory(
-            [(base_addr, primary_kv_view.nbytes, NIXL_DEV_ID, "")], "DRAM"
-        )
         self._block_size_bytes = stride
+        num_blocks = len(primary_kv_view)
+
+        # Register the primary CPU buffer in chunks no larger than
+        # MAX_REG_BYTES, aligned to block boundaries so no KV block straddles
+        # two registrations (NIXL requires each transfer descriptor to be
+        # covered by a single registration).
+        if stride > MAX_REG_BYTES:
+            raise RuntimeError(
+                f"An offloaded KV chunk ({stride} bytes) exceeds the maximum NIXL "
+                f"registration size ({MAX_REG_BYTES} bytes). Reduce block_size."
+            )
+        blocks_per_chunk = MAX_REG_BYTES // stride
+        for start_block in range(0, num_blocks, blocks_per_chunk):
+            n = min(blocks_per_chunk, num_blocks - start_block)
+            chunk_addr = base_addr + start_block * stride
+            chunk_len = n * stride
+            reg = self._agent.register_memory(
+                [(chunk_addr, chunk_len, NIXL_DEV_ID, "")], "DRAM"
+            )
+            self._primary_regs.append(reg)
+
         all_blocks = [
-            (base_addr + i * stride, stride, NIXL_DEV_ID)
-            for i in range(len(primary_kv_view))
+            (base_addr + i * stride, stride, NIXL_DEV_ID) for i in range(num_blocks)
         ]
         # NIXL_INIT_AGENT marks this as the local side; make_prepped_xfer requires
         # local_xfer_side tagged with NIXL_INIT_AGENT and remote_xfer_side tagged
@@ -206,16 +230,21 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         an exception indicates misconfigured obj store params and raises RuntimeError.
         """
         probe_key = "__nixl_probe__/connectivity_test"
+        if self._is_accelerated:
+            hint = "check type and endpoint_override."
+        else:
+            hint = (
+                "check bucket, endpoint_override, and scheme. If using explicit "
+                "credentials verify access_key and secret_key; otherwise ensure "
+                "the AWS SDK default credential chain is configured (IAM role, "
+                "env vars, credential file)."
+            )
         try:
             self._exists(probe_key)
             logger.info("Object store tier connectivity probe succeeded")
         except Exception as e:
             raise RuntimeError(
-                f"Object store tier connectivity probe failed — check bucket, "
-                f"endpoint_override, and scheme. If using explicit credentials "
-                f"verify access_key and secret_key; otherwise ensure the AWS "
-                f"SDK default credential chain is configured (IAM role, env "
-                f"vars, credential file). Error: {e}"
+                f"Object store tier connectivity probe failed — {hint} Error: {e}"
             ) from e
 
     def _exists(self, obj_key: str) -> bool:
@@ -453,9 +482,9 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
             except Exception as exc:
                 logger.warning("failed to release DRAM prepped handle: %s", exc)
             self._dram_prepped_handle = None
-        if self._primary_reg is not None:
+        for reg in self._primary_regs:
             try:
-                self._agent.deregister_memory(self._primary_reg)
+                self._agent.deregister_memory(reg)
             except Exception as exc:
                 logger.warning("failed to deregister primary buffer: %s", exc)
-            self._primary_reg = None
+        self._primary_regs = []

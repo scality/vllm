@@ -10,6 +10,7 @@ state machine: job submission, transfer completion polling, and lookup.
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -145,6 +146,8 @@ class MockNixlAgent:
         self._pending: dict[int, tuple[str, list[str]]] = {}
         self._handle_counter = 0
         self._last_obj_keys: list[str] = []
+        # Recorded DRAM registrations as (addr, len) tuples.
+        self.dram_regs: list[tuple[int, int]] = []
         # Bind default implementations as instance attributes.
         self.register_memory = self._register_memory
         self.make_prepped_xfer = self._make_prepped_xfer
@@ -160,6 +163,9 @@ class MockNixlAgent:
         # Capture obj_keys from OBJ 4-tuples: (addr, len, dev_id, obj_key)
         if mem_type == "OBJ" and descs:
             self._last_obj_keys = [d[3] for d in descs if d[3]]
+        # Record DRAM registrations as (addr, len) for chunking assertions.
+        if mem_type == "DRAM" and descs:
+            self.dram_regs.extend((d[0], d[1]) for d in descs)
         return mock
 
     def deregister_memory(self, desc):
@@ -229,6 +235,8 @@ def _make_tier(
     num_blocks: int = 4,
     offloading_spec: SimpleNamespace = _OFFLOADING_SPEC,
     primary_kv_view: memoryview | None = None,
+    store_config: dict | None = None,
+    max_reg_bytes: int | None = None,
     **tier_kwargs,
 ) -> tuple[ObjectStoreSecondaryTierManager, MockNixlAgent]:
     """Create a tier backed by a fresh MockNixlAgent."""
@@ -236,18 +244,28 @@ def _make_tier(
     if primary_kv_view is None:
         tensor = torch.zeros((num_blocks, _BLOCK_ELEMENTS), dtype=_DTYPE)
         primary_kv_view = memoryview(tensor.numpy())
-    with (
+    ctx = [
         patch("vllm.v1.kv_offload.tiering.obj.manager.nixl_agent_config"),
         patch(
             "vllm.v1.kv_offload.tiering.obj.manager.nixl_agent",
             return_value=mock_agent,
         ),
-    ):
+    ]
+    if max_reg_bytes is not None:
+        ctx.append(
+            patch(
+                "vllm.v1.kv_offload.tiering.obj.manager.MAX_REG_BYTES",
+                max_reg_bytes,
+            )
+        )
+    with ExitStack() as stack:
+        for cm in ctx:
+            stack.enter_context(cm)
         tier = ObjectStoreSecondaryTierManager(
             offloading_spec=offloading_spec,
             primary_kv_view=primary_kv_view,
             tier_type="obj",
-            store_config=_STORE_CONFIG,
+            store_config=store_config or _STORE_CONFIG,
             prefix=_RUN_PREFIX,
             **tier_kwargs,
         )
@@ -595,7 +613,7 @@ class TestMockObjTierShutdown:
         tier.shutdown()
         assert len(tier._transfers) == 0
         assert tier._dram_prepped_handle is None
-        assert tier._primary_reg is None
+        assert tier._primary_regs == []
 
     def test_shutdown_idempotent(self):
         tier, _ = _make_tier(num_blocks=4)
@@ -719,6 +737,16 @@ class TestObjTierKVEvents:
         assert list(tier.take_events()) == []
 
 
+_ACCEL_STORE_CONFIG = {
+    "accelerated": True,
+    "type": "scality_ai_connector",
+    "endpoint_override": "http://10.0.0.1:81",
+}
+
+# Bytes per block in the test fixtures: _BLOCK_ELEMENTS float32 elements.
+_STRIDE = _BLOCK_ELEMENTS * 4
+
+
 class TestObjStoreConfig:
     def test_explicit_credentials_included(self):
         cfg = ObjStoreConfig(
@@ -764,6 +792,81 @@ class TestObjStoreConfig:
         assert params["ca_bundle"] == "/path/to/ca.pem"
         assert "access_key" not in params
 
+    def test_s3_to_nixl_params(self):
+        cfg = ObjStoreConfig(**_STORE_CONFIG)
+        params = cfg.to_nixl_params()
+        assert params == {
+            "bucket": "mock-bucket",
+            "endpoint_override": "mock:9000",
+            "scheme": "http",
+            "access_key": "mock-access",
+            "secret_key": "mock-secret",
+        }
+
+    def test_s3_missing_required_raises(self):
+        with pytest.raises(ValueError, match="bucket"):
+            ObjStoreConfig(
+                endpoint_override="mock:9000", access_key="a", secret_key="b"
+            )
+
+    def test_missing_endpoint_raises(self):
+        with pytest.raises(ValueError, match="endpoint_override"):
+            ObjStoreConfig(
+                endpoint_override="",
+                bucket="b",
+                access_key="a",
+                secret_key="s",
+            )
+
+    def test_accelerated_to_nixl_params(self):
+        cfg = ObjStoreConfig(**_ACCEL_STORE_CONFIG)
+        assert cfg.accelerated is True
+        assert cfg.to_nixl_params() == {
+            "accelerated": "true",
+            "type": "scality_ai_connector",
+            "endpoint_override": "http://10.0.0.1:81",
+        }
+
+    def test_accelerated_extra_params_passthrough(self):
+        cfg = ObjStoreConfig(
+            **_ACCEL_STORE_CONFIG, extra_params={"req_checksum": "required"}
+        )
+        params = cfg.to_nixl_params()
+        assert params["req_checksum"] == "required"
+        assert "bucket" not in params and "access_key" not in params
+
+    def test_accelerated_string_bool_normalization(self):
+        cfg = ObjStoreConfig(
+            accelerated="true",
+            type="dell",
+            endpoint_override="http://x:1",
+        )
+        assert cfg.accelerated is True
+        assert cfg.to_nixl_params()["type"] == "dell"
+
+    def test_accelerated_missing_type_raises(self):
+        with pytest.raises(ValueError, match="type"):
+            ObjStoreConfig(accelerated=True, endpoint_override="http://x:1")
+
+    @pytest.mark.parametrize("s3_field", ["bucket", "session_token", "region"])
+    def test_accelerated_mixed_mode_raises(self, s3_field):
+        with pytest.raises(ValueError, match=f"S3-only fields: {s3_field}"):
+            ObjStoreConfig(
+                accelerated=True,
+                type="scality_ai_connector",
+                endpoint_override="http://x:1",
+                **{s3_field: "b"},
+            )
+
+    def test_accelerated_reserved_extra_param_raises(self):
+        with pytest.raises(ValueError, match="reserved"):
+            ObjStoreConfig(
+                accelerated=True,
+                type="scality_ai_connector",
+                endpoint_override="http://x:1",
+                extra_params={"num_threads": "8"},
+            )
+
 
 def test_obj_tier_replicated_layout_collapses_mapper_identity():
     """TP=2 and TP=4 replicated configs share the obj FileMapper namespace."""
@@ -797,3 +900,63 @@ def test_obj_tier_replicated_layout_collapses_mapper_identity():
     finally:
         tp2_tier.shutdown()
         tp4_tier.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Chunked DRAM registration
+# ---------------------------------------------------------------------------
+
+
+class TestObjTierChunkedRegistration:
+    def test_single_chunk_under_limit(self):
+        tier, agent = _make_tier(num_blocks=4)
+        # Whole buffer fits in one registration under the default 4 GiB cap.
+        assert len(agent.dram_regs) == 1
+        assert agent.dram_regs[0][1] == 4 * _STRIDE
+        assert len(tier._primary_regs) == 1
+
+    def test_multiple_chunks_block_aligned(self):
+        # 2048-byte cap with 1024-byte blocks => 2 blocks per chunk.
+        tier, agent = _make_tier(num_blocks=8, max_reg_bytes=2 * _STRIDE)
+        regs = agent.dram_regs
+        assert len(regs) == 4
+        # Each chunk is <= cap and a whole multiple of the block stride.
+        for _, length in regs:
+            assert length <= 2 * _STRIDE
+            assert length % _STRIDE == 0
+        # Chunks are contiguous and exactly cover the whole buffer.
+        base = regs[0][0]
+        offset = 0
+        for addr, length in regs:
+            assert addr == base + offset
+            offset += length
+        assert offset == 8 * _STRIDE
+        assert len(tier._primary_regs) == 4
+
+    def test_roundtrip_across_chunk_boundary(self):
+        tier, _ = _make_tier(num_blocks=8, max_reg_bytes=2 * _STRIDE)
+        keys = [key(i) for i in range(8)]
+        tier.submit_store(make_job(1, keys, list(range(8))))
+        results = drain(tier)
+        assert len(results) == 1 and results[0].success
+        tier.submit_load(make_job(2, keys, list(range(8))))
+        results = drain(tier)
+        assert len(results) == 1 and results[0].success
+        assert lookup_and_wait(tier, keys) == [LookupResult.HIT] * 8
+
+    def test_block_larger_than_max_raises(self):
+        with pytest.raises(RuntimeError, match="offloaded KV chunk"):
+            _make_tier(num_blocks=4, max_reg_bytes=_STRIDE // 2)
+
+    def test_shutdown_deregisters_all_chunks(self):
+        tier, agent = _make_tier(num_blocks=8, max_reg_bytes=2 * _STRIDE)
+        regs = list(tier._primary_regs)
+        with patch.object(agent, "deregister_memory") as deregister:
+            tier.shutdown()
+        assert [c.args[0] for c in deregister.call_args_list] == regs
+
+
+class TestObjTierAccelerated:
+    def test_accelerated_tier_created(self):
+        tier, _ = _make_tier(num_blocks=4, store_config=_ACCEL_STORE_CONFIG)
+        assert tier._is_accelerated is True
