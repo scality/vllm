@@ -108,16 +108,7 @@ class ObjAsyncLookupManager(AsyncLookupManager):
     def batch_lookup(
         self, keys: list[OffloadKey], req_context: ReqContext
     ) -> Iterable[bool]:
-        descriptors = [
-            (
-                _PROBE_ADDR,
-                _PROBE_LEN,
-                _PROBE_DEV_ID,
-                self._tier._file_mapper.get_file_name(k),
-            )
-            for k in keys
-        ]
-        results = self._tier._agent.query_memory(descriptors, "OBJ", "OBJ")
+        results = self._tier._query_existence(keys)
         return (r is not None for r in results)
 
 
@@ -225,6 +216,19 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         self._lookup_manager = ObjAsyncLookupManager(
             tier=self, tier_type=self.tier_type
         )
+
+    def _query_existence(self, keys: Iterable[OffloadKey]) -> list:
+        """One NIXL existence query for ``keys``; ``None`` marks a missing key."""
+        descriptors = [
+            (
+                _PROBE_ADDR,
+                _PROBE_LEN,
+                _PROBE_DEV_ID,
+                self._file_mapper.get_file_name(k),
+            )
+            for k in keys
+        ]
+        return self._agent.query_memory(descriptors, "OBJ", "OBJ")
 
     def _probe_connectivity(self) -> None:
         """Verify object store connectivity at startup via a NIXL lookup probe.
