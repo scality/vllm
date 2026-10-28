@@ -148,14 +148,25 @@ class MockNixlAgent:
         self._last_obj_keys: list[str] = []
         # Recorded DRAM registrations as (addr, len) tuples.
         self.dram_regs: list[tuple[int, int]] = []
+        # Backend names passed to create_backend() and query_memory().
+        self.created_backends: list[str] = []
+        self.queried_backends: list[str] = []
         # Bind default implementations as instance attributes.
         self.register_memory = self._register_memory
         self.make_prepped_xfer = self._make_prepped_xfer
         self.check_xfer_state = self._check_xfer_state
         self.query_memory = self._query_memory
 
+    def get_plugin_list(self):
+        return ["OBJ", "REST", "POSIX"]
+
+    def get_plugin_mem_types(self, backend):
+        return {"OBJ": ["OBJ"], "REST": ["DRAM", "VRAM", "OBJ"]}.get(
+            backend, ["DRAM", "FILE"]
+        )
+
     def create_backend(self, backend_type, params):
-        pass
+        self.created_backends.append(backend_type)
 
     def _register_memory(self, descs, mem_type=None, backends=None):
         mock = MagicMock()
@@ -211,7 +222,8 @@ class MockNixlAgent:
     def get_xfer_telemetry(self, handle):
         return SimpleNamespace(xferDuration=1000)
 
-    def _query_memory(self, queries, mem_type, agent_name):
+    def _query_memory(self, queries, backend, mem_type):
+        self.queried_backends.append(backend)
         return [object() if q[3] in self._stored_obj_keys else None for q in queries]
 
 
@@ -737,6 +749,11 @@ class TestObjTierKVEvents:
         assert list(tier.take_events()) == []
 
 
+_REST_STORE_CONFIG = {
+    "backend": "REST",
+    "endpoint_override": "http://10.0.0.1:10000",
+}
+
 _ACCEL_STORE_CONFIG = {
     "accelerated": True,
     "type": "scality_ai_connector",
@@ -859,6 +876,31 @@ class TestObjStoreConfig:
                 extra_params={"num_threads": "8"},
             )
 
+    def test_other_backend_to_nixl_params(self):
+        cfg = ObjStoreConfig(
+            **_REST_STORE_CONFIG, extra_params={"rdma_nics": "mlx5_1,mlx5_2"}
+        )
+        assert cfg.to_nixl_params() == {
+            "endpoint_override": "http://10.0.0.1:10000",
+            "rdma_nics": "mlx5_1,mlx5_2",
+        }
+
+    @pytest.mark.parametrize(
+        "extra",
+        [{"accelerated": True}, {"type": "scality_ai_connector"}],
+    )
+    def test_other_backend_rejects_obj_engine_selection(self, extra):
+        with pytest.raises(ValueError, match="accelerated"):
+            ObjStoreConfig(**_REST_STORE_CONFIG, **extra)
+
+    def test_other_backend_rejects_s3_fields(self):
+        with pytest.raises(ValueError, match="S3-only"):
+            ObjStoreConfig(**_REST_STORE_CONFIG, bucket="b")
+
+    def test_other_backend_endpoint_optional(self):
+        cfg = ObjStoreConfig(backend="AZURE_BLOB", extra_params={"account": "a"})
+        assert cfg.to_nixl_params() == {"account": "a"}
+
 
 # ---------------------------------------------------------------------------
 # Chunked DRAM registration
@@ -951,3 +993,24 @@ class TestObjTierAccelerated:
     def test_accelerated_tier_created(self):
         tier, _ = _make_tier(num_blocks=4, store_config=_ACCEL_STORE_CONFIG)
         assert tier._is_accelerated is True
+
+    def test_rest_tier_uses_rest_backend(self):
+        """Backend creation and existence queries both target REST, not OBJ."""
+        tier, agent = _make_tier(num_blocks=4, store_config=_REST_STORE_CONFIG)
+        try:
+            assert agent.created_backends == ["REST"]
+            tier.submit_store(make_job(1, [key(1)], [0]))
+            assert all(r.success for r in drain(tier))
+            assert lookup_and_wait(tier, [key(1), key(2)]) == [
+                LookupResult.HIT,
+                LookupResult.MISS,
+            ]
+            assert agent.queried_backends
+            assert set(agent.queried_backends) == {"REST"}
+        finally:
+            tier.shutdown()
+
+    @pytest.mark.parametrize("backend", ["POSIX", "MISSING"])
+    def test_backend_without_obj_segments_raises(self, backend):
+        with pytest.raises(ValueError, match="object segments"):
+            _make_tier(store_config={"backend": backend})

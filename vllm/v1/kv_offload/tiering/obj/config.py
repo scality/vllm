@@ -4,6 +4,11 @@
 
 from dataclasses import dataclass, field
 
+# NIXL's S3 plugin. Any other backend that exposes OBJ_SEG (e.g. ``REST``,
+# ``AZURE_BLOB``) is configured only through ``endpoint_override`` and
+# ``extra_params``.
+_S3_BACKEND = "OBJ"
+
 # NIXL backend params that the accelerated engine owns or that the manager
 # injects (``num_threads`` from ``io_threads``). They may not be overridden
 # through ``extra_params``.
@@ -29,7 +34,7 @@ def _is_truthy(value: object) -> bool:
 class ObjStoreConfig:
     """Connection parameters for an object store backend.
 
-    Two modes are supported:
+    Three modes are supported, the first two on NIXL's S3 plugin (``OBJ``):
 
     - **S3 mode** (default): drives NIXL's default AWS-SDK S3 engine over
       HTTP(S). Requires ``bucket`` and ``endpoint_override``. When
@@ -42,9 +47,15 @@ class ObjStoreConfig:
       over cuObject/GPUDirect RDMA. Requires ``type`` and ``endpoint_override``;
       ``bucket``/``access_key``/``secret_key``/``scheme`` are not used.
       Engine-specific params may be passed through ``extra_params``.
+    - **Other OBJ_SEG backend** (``backend`` other than ``OBJ``, e.g.
+      ``REST`` for the Scality AI Connector): any NIXL plugin that exposes
+      object segments. ``endpoint_override`` (when set) and ``extra_params``
+      are passed through as its params; S3 fields, ``accelerated`` and
+      ``type`` are not used.
     """
 
-    endpoint_override: str
+    backend: str = _S3_BACKEND
+    endpoint_override: str = ""
     # Accelerated-engine params.
     accelerated: bool = False
     type: str = ""
@@ -60,13 +71,27 @@ class ObjStoreConfig:
 
     def __post_init__(self) -> None:
         self.accelerated = _is_truthy(self.accelerated)
+        if not self.backend:
+            raise ValueError("ObjStoreConfig requires a non-empty 'backend'")
+
+        if self.backend != _S3_BACKEND:
+            self._validate_other_backend()
+            return
         if not self.endpoint_override:
             raise ValueError("ObjStoreConfig requires 'endpoint_override'")
-
         if self.accelerated:
             self._validate_accelerated()
         else:
             self._validate_s3()
+
+    def _validate_other_backend(self) -> None:
+        if self.accelerated or self.type:
+            raise ValueError(
+                f"Object store tier with backend {self.backend!r} must not set "
+                f"'accelerated' or 'type'; those select an engine of the "
+                f"{_S3_BACKEND} backend."
+            )
+        self._validate_passthrough_params(self.backend)
 
     def _validate_accelerated(self) -> None:
         if not self.type:
@@ -74,11 +99,14 @@ class ObjStoreConfig:
                 "Accelerated object store tier requires 'type' "
                 "(e.g. 'scality_ai_connector') and 'endpoint_override'."
             )
+        self._validate_passthrough_params("Accelerated")
+
+    def _validate_passthrough_params(self, mode: str) -> None:
         mixed = [f for f in _S3_ONLY_FIELDS if getattr(self, f)]
         if mixed:
             raise ValueError(
-                f"Accelerated object store tier must not set S3-only fields: "
-                f"{', '.join(mixed)}. These are ignored by accelerated engines."
+                f"{mode} object store tier must not set S3-only fields: "
+                f"{', '.join(mixed)}. These are only used by the S3 engine."
             )
         reserved = _RESERVED_ACCELERATED_PARAMS & set(self.extra_params)
         if reserved:
@@ -95,9 +123,16 @@ class ObjStoreConfig:
             )
 
     def to_nixl_params(self) -> dict[str, str]:
-        """Build the NIXL OBJ backend params dict."""
+        """Build the params dict for the NIXL backend named by ``backend``."""
+        if self.backend != _S3_BACKEND:
+            params: dict[str, str] = {}
+            if self.endpoint_override:
+                params["endpoint_override"] = self.endpoint_override
+            params.update({k: str(v) for k, v in self.extra_params.items()})
+            return params
+
         if self.accelerated:
-            params: dict[str, str] = {
+            params = {
                 "accelerated": "true",
                 "type": self.type,
                 "endpoint_override": self.endpoint_override,

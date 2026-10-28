@@ -257,6 +257,24 @@ Accelerated mode does not use the S3 engine keys; supplying `bucket`, `access_ke
 
 Accelerated engines require NIXL's OBJ plugin built with cuObject/GPUDirect Storage and an RDMA-capable fabric reachable by the endpoint. cuObject caps a single memory registration at 4 GiB, so vLLM registers the CPU buffer in chunks aligned to block boundaries; the offload path stays CPU-staged (GPU↔CPU↔store). `block_size` must not exceed 4 GiB.
 
+**Other object backends**: set `store_config.backend` to any NIXL plugin that exposes object segments (`OBJ_SEG`), such as `REST` (Scality AI Connector, HTTP control plane with an RDMA data plane) or `AZURE_BLOB`. The tier checks at startup that the plugin is available and supports object segments.
+
+| `store_config` key | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `backend` | no | `OBJ` | NIXL plugin name. Any value other than `OBJ` selects this mode. |
+| `endpoint_override` | backend-specific | `""` | Passed to the plugin when set. |
+| `extra_params` | no | `{}` | Plugin params, passed through unchanged (e.g. `rdma_nics` for `REST`). |
+
+S3 engine keys and `accelerated`/`type` are rejected in this mode. For example, with the `REST` plugin:
+
+```json
+"store_config": {
+  "backend": "REST",
+  "endpoint_override": "http://10.0.0.1:10000",
+  "extra_params": {"rdma_nics": "mlx5_1,mlx5_2"}
+}
+```
+
 Object keys follow the same run-configuration digest scheme as the filesystem tier (see [On-Disk Layout](#on-disk-layout)) and are stored under the optional `prefix`. The [Cross-Process Sharing](#cross-process-sharing) behavior applies to shared buckets as well, so instances sharing a bucket produce identical keys for identical content; set a shared `PYTHONHASHSEED` if you want a custom seed. At startup the tier probes object store connectivity and fails fast with a configuration error if the bucket is unreachable.
 
 ### P2P (Including P/D)

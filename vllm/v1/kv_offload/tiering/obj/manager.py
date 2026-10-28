@@ -96,7 +96,9 @@ class ObjAsyncLookupManager(AsyncLookupManager):
             )
             for k in keys
         ]
-        results = self._tier._agent.query_memory(descriptors, "OBJ", "OBJ")
+        results = self._tier._agent.query_memory(
+            descriptors, self._tier._backend, "OBJ"
+        )
         return (r is not None for r in results)
 
 
@@ -164,9 +166,16 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         agent_config = nixl_agent_config(backends=[])
         self._agent = nixl_agent("ObjAgent", agent_config)
         obj_config = ObjStoreConfig(**store_config)
+        self._backend = obj_config.backend
+        if "OBJ" not in self._agent.get_plugin_mem_types(self._backend):
+            raise ValueError(
+                f"NIXL backend {self._backend!r} is not available or does not "
+                f"support object segments (OBJ). Available plugins: "
+                f"{', '.join(self._agent.get_plugin_list())}."
+            )
         self._is_accelerated = obj_config.accelerated
         params = {**obj_config.to_nixl_params(), "num_threads": str(io_threads)}
-        self._agent.create_backend("OBJ", params)
+        self._agent.create_backend(self._backend, params)
         self._transfers: dict[int, TransferEntry] = {}
         # Buffered results awaiting the next get_finished_jobs() call:
         # submission-time failures + poll-time completions accumulated
@@ -230,7 +239,9 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         an exception indicates misconfigured obj store params and raises RuntimeError.
         """
         probe_key = "__nixl_probe__/connectivity_test"
-        if self._is_accelerated:
+        if self._backend != "OBJ":
+            hint = f"endpoint_override and extra_params of backend {self._backend}"
+        elif self._is_accelerated:
             hint = "type and endpoint_override"
         else:
             hint = (
@@ -250,7 +261,7 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
 
     def _exists(self, obj_key: str) -> bool:
         results = self._agent.query_memory(
-            [(_PROBE_ADDR, _PROBE_LEN, _PROBE_DEV_ID, obj_key)], "OBJ", "OBJ"
+            [(_PROBE_ADDR, _PROBE_LEN, _PROBE_DEV_ID, obj_key)], self._backend, "OBJ"
         )
         return results[0] is not None
 
