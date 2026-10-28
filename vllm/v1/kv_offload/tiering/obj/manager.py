@@ -167,10 +167,10 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         self._agent = nixl_agent("ObjAgent", agent_config)
         obj_config = ObjStoreConfig(**store_config)
         self._backend = obj_config.backend
-        if "OBJ" not in self._agent.get_plugin_mem_types(self._backend):
+        if "OBJ_SEG" not in self._agent.get_plugin_mem_types(self._backend):
             raise ValueError(
                 f"NIXL backend {self._backend!r} is not available or does not "
-                f"support object segments (OBJ). Available plugins: "
+                f"support object segments (OBJ_SEG). Available plugins: "
                 f"{', '.join(self._agent.get_plugin_list())}."
             )
         self._is_accelerated = obj_config.accelerated

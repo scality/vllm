@@ -161,9 +161,11 @@ class MockNixlAgent:
         return ["OBJ", "REST", "POSIX"]
 
     def get_plugin_mem_types(self, backend):
-        return {"OBJ": ["OBJ"], "REST": ["DRAM", "VRAM", "OBJ"]}.get(
-            backend, ["DRAM", "FILE"]
-        )
+        # Same strings as the real NIXL binding (nixlEnumStrings::memTypeStr).
+        return {
+            "OBJ": ["OBJ_SEG"],
+            "REST": ["DRAM_SEG", "VRAM_SEG", "OBJ_SEG"],
+        }.get(backend, ["DRAM_SEG", "FILE_SEG"])
 
     def create_backend(self, backend_type, params):
         self.created_backends.append(backend_type)
