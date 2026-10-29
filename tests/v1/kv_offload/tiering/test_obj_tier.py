@@ -565,6 +565,46 @@ class TestMockObjTierFailures:
         assert not tier._transfers
         assert list(tier.get_finished_jobs()) == []
 
+    def test_agent_created_with_telemetry(self):
+        with (
+            patch(
+                "vllm.v1.kv_offload.tiering.obj.manager.nixl_agent_config"
+            ) as agent_config,
+            patch(
+                "vllm.v1.kv_offload.tiering.obj.manager.nixl_agent",
+                return_value=MockNixlAgent(),
+            ),
+        ):
+            tensor = torch.zeros((4, _BLOCK_ELEMENTS), dtype=_DTYPE)
+            ObjectStoreSecondaryTierManager(
+                offloading_spec=_OFFLOADING_SPEC,
+                primary_kv_view=memoryview(tensor.numpy()),
+                tier_type="obj",
+                store_config=_STORE_CONFIG,
+                prefix=_RUN_PREFIX,
+            )
+        assert agent_config.call_args.kwargs.get("capture_telemetry") is True
+
+    def test_telemetry_failure_does_not_fail_job(self, monkeypatch):
+        tier, agent = _make_tier(num_blocks=4)
+        monkeypatch.setattr(
+            agent,
+            "get_xfer_telemetry",
+            MagicMock(side_effect=RuntimeError("NIXL_ERR_NO_TELEMETRY")),
+        )
+        release_xfer = MagicMock()
+        monkeypatch.setattr(agent, "release_xfer_handle", release_xfer)
+
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        results = list(tier.get_finished_jobs())
+
+        assert len(results) == 1
+        assert results[0].job_id == 1
+        assert results[0].success
+        assert results[0].transfer_time is None
+        release_xfer.assert_called_once()
+        assert not tier._transfers
+
     def test_xfer_cleanup_retry_finalizes_parent_job_and_primary_pin(self, monkeypatch):
         num_blocks = 4
         tensor = torch.zeros((num_blocks, _BLOCK_ELEMENTS), dtype=_DTYPE)
