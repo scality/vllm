@@ -917,6 +917,75 @@ class TestTieringOffloadingManager:
         assert set(jm_b.keys) == {chunks[2], chunks[3]}
         assert jm_b.req_context is ctx_b
 
+    def _sliced_manager(self, slice_chunks: int) -> TieringOffloadingManager:
+        return TieringOffloadingManager(
+            primary_tier=self.primary_tier,
+            secondary_tiers=[self.secondary_tier1, self.secondary_tier2],
+            promotion_slice_chunks=slice_chunks,
+        )
+
+    def test_sliced_promotion_completes_slice_by_slice(self, manager_setup):
+        """With promotion_slice_chunks, a request's promotion is submitted in
+        jobs of that many chunks, and a load reserved on its chunks pins each
+        one when its job completes."""
+        self.manager = self._sliced_manager(2)
+        chunks = to_keys(range(3))
+        for chunk in chunks:
+            self.secondary_tier1.chunks[chunk] = True
+        self.secondary_tier1.submit_load = MagicMock(
+            wraps=self.secondary_tier1.submit_load
+        )
+        self._start_request()
+
+        for chunk in chunks:
+            assert self.manager.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
+            assert self.manager.is_promotion_pending(chunk)
+        spec = self.manager.reserve_load(chunks, _CTX)
+        assert len(spec.block_ids) == 3
+
+        self._simulate_on_schedule_end()
+        submitted = [
+            c.args[0].keys for c in self.secondary_tier1.submit_load.call_args_list
+        ]
+        assert submitted == [chunks[:2], chunks[2:]]
+
+        # The example tier completes its jobs by the next poll.
+        self._simulate_on_schedule_end()
+        promoted, failed = self.manager.take_promotion_results()
+        assert sorted(promoted) == sorted(chunks)
+        assert failed == []
+        for chunk in chunks:
+            assert not self.manager.is_promotion_pending(chunk)
+            assert self.primary_tier._policy.get(chunk).ref_cnt == 1
+        assert self.manager.take_promotion_results() == ([], [])
+
+        self.manager.complete_load(chunks, _CTX)
+        for chunk in chunks:
+            assert self.primary_tier._policy.get(chunk).ref_cnt == 0
+
+    def test_promotion_results_only_cover_reserved_chunks(self, manager_setup):
+        """A promotion no load waits for leaves no result to take."""
+        self.manager = self._sliced_manager(2)
+        chunks = to_keys(range(2))
+        for chunk in chunks:
+            self.secondary_tier1.chunks[chunk] = True
+        self._start_request()
+        for chunk in chunks:
+            self.manager.lookup(chunk, _CTX)
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+        assert self.manager.take_promotion_results() == ([], [])
+        assert self.manager.lookup(chunks[0], _CTX) is LookupResult.HIT
+
+    def test_unsliced_promotion_is_not_reported_pending(self, manager_setup):
+        """Without slices, a load gains nothing from starting before its
+        promotion completes."""
+        chunk = to_keys([7])[0]
+        self.secondary_tier1.chunks[chunk] = True
+        self._start_request()
+        assert self.manager.lookup(chunk, _CTX) is LookupResult.HIT_PENDING
+        assert not self.manager.is_promotion_pending(chunk)
+
     def test_lookup_shared_chunk_no_duplicate_promotion(self, manager_setup):
         """A chunk looked up by two requests in the same step is promoted once.
 

@@ -43,6 +43,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
+    LoadStoreSpec,
     Locality,
     LookupResult,
     Medium,
@@ -356,6 +357,28 @@ class RequestGroupState:
 
 
 @dataclass(slots=True)
+class StreamingLoad:
+    """A load scheduled while some of its chunks are still being promoted
+    into the offloading medium. Its chunks are loaded to GPU in pieces, as
+    their promotion completes."""
+
+    # Keys in chunk order, the source spec of all of them, and for each its
+    # position in that spec, its destination GPU blocks, and the logical index
+    # (in GPU blocks within the request) of the first of them.
+    keys: list[OffloadKey]
+    src_spec: LoadStoreSpec
+    src_index: dict[OffloadKey, int]
+    dst_block_ids: dict[OffloadKey, list[int]]
+    first_block_index: dict[OffloadKey, int]
+    # Keys whose promotion has not completed.
+    pending: set[OffloadKey]
+    # Keys promoted and pinned, not yet part of a load piece.
+    ready: set[OffloadKey]
+    # A promotion failed: the request recomputes instead of loading.
+    failed: bool = False
+
+
+@dataclass(slots=True)
 class RequestOffloadState:
     config: SchedulerOffloadConfig
     req: Request
@@ -371,8 +394,11 @@ class RequestOffloadState:
     # True once the GPU-local prefix has been recorded for this request.
     gpu_prefix_access_recorded: bool = False
     # In-flight job IDs. Per the connector's invariant, at any given time
-    # this contains either a single load job, or one or more store jobs.
+    # this contains either load jobs (a single one, unless the load is
+    # streamed in pieces), or one or more store jobs.
     transfer_jobs: set[int] = field(default_factory=set)
+    # Set while a load waits for some of its chunks to be promoted.
+    streaming_load: StreamingLoad | None = None
     # time.monotonic() of this request's first deferred offload lookup;
     # None once consumed (observed) or while no lookup is pending.
     deferred_lookup_start_time: float | None = None
@@ -593,6 +619,21 @@ class OffloadingConnectorScheduler:
 
         sliding_window_groups.sort(key=_sliding_window_sort_key, reverse=True)
 
+        # A request is scheduled before its chunks are promoted only for a
+        # single full-attention group, whose pieces are contiguous runs of GPU
+        # blocks, and only if a failed promotion can fall back to recomputing.
+        self._stream_promoted_loads = (
+            len(self.config.kv_group_configs) == 1
+            and not sliding_window_groups
+            and not isinstance(self.config.kv_group_configs[0].kv_cache_spec, MambaSpec)
+            and vllm_config.kv_transfer_config is not None
+            and vllm_config.kv_transfer_config.kv_load_failure_policy == "recompute"
+        )
+        # Requests with a streaming load, and the requests whose streamed
+        # load ended this step (True if it failed).
+        self._streaming_loads: dict[ReqId, RequestOffloadState] = {}
+        self._load_ends: dict[ReqId, bool] = {}
+
         # used by _lookup
         self._full_attention_groups: tuple[int, ...] = tuple(full_attention_groups)
         self._sliding_window_groups: tuple[int, ...] = tuple(sliding_window_groups)
@@ -697,7 +738,10 @@ class OffloadingConnectorScheduler:
                     )
                     hit_count += 1
                 case LookupResult.HIT_PENDING:
-                    defer_lookup = True
+                    # A chunk being promoted can be loaded once its
+                    # promotion completes: schedule the request now.
+                    if not self._can_stream(key):
+                        defer_lookup = True
                     hit_count += 1
                 case LookupResult.RETRY:
                     # Don't break: keep scanning to let manager kick off
@@ -706,6 +750,19 @@ class OffloadingConnectorScheduler:
                 case LookupResult.MISS:
                     break
         return hit_count if not defer_lookup else None
+
+    def _can_stream(self, key: OffloadKey) -> bool:
+        if not self.manager.is_promotion_pending(key):
+            return False
+        if not self._stream_promoted_loads:
+            logger.warning_once(
+                "promotion_slice_chunks is set, but loads are not started "
+                "before their promotion completes: this needs a single "
+                "full-attention KV cache group and "
+                "kv_load_failure_policy='recompute'."
+            )
+            return False
+        return True
 
     def _sliding_window_lookup(
         self,
@@ -1256,6 +1313,19 @@ class OffloadingConnectorScheduler:
             if req_status.offloading_context.policy == OffloadPolicy.CHUNK_LEVEL:
                 group_state.next_stored_chunk_idx = num_chunks
 
+        if self._stream_promoted_loads and any(
+            self.manager.is_promotion_pending(key) for key in keys_to_load
+        ):
+            # a load can only be issued when no other jobs are pending.
+            assert not req_status.transfer_jobs
+            self._start_streaming_load(
+                req_status, keys_to_load, dst_block_ids, block_indices[0]
+            )
+            if self._chunks_being_loaded is not None:
+                self._chunks_being_loaded.update(keys_to_load)
+            req_status.partial_tail_boundary = None
+            return
+
         src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
         dst_spec = GPULoadStoreSpec(
             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
@@ -1280,6 +1350,159 @@ class OffloadingConnectorScheduler:
         if self._chunks_being_loaded is not None:
             self._chunks_being_loaded.update(keys_to_load)
         req_status.partial_tail_boundary = None
+
+    def _start_streaming_load(
+        self,
+        req_status: RequestOffloadState,
+        keys: list[OffloadKey],
+        dst_block_ids: list[int],
+        load_start_block_index: int,
+    ) -> None:
+        """Pin a load's chunks, some still being promoted, and load the ones
+        already promoted. The others are loaded as their promotion completes,
+        by _advance_streaming_loads().
+
+        Args:
+            req_status: The request, with a single KV cache group.
+            keys: Keys of the chunks to load, in chunk order.
+            dst_block_ids: GPU blocks receiving them.
+            load_start_block_index: Logical index of dst_block_ids[0] within
+                the request, in GPU blocks.
+
+        """
+        src_spec = self.manager.reserve_load(keys, req_status.req_context)
+        blocks_per_chunk = self.config.blocks_per_chunk
+        start_chunk_idx = load_start_block_index // blocks_per_chunk
+        end_block_index = load_start_block_index + len(dst_block_ids)
+
+        load = StreamingLoad(
+            keys=list(keys),
+            src_spec=src_spec,
+            src_index={},
+            dst_block_ids={},
+            first_block_index={},
+            pending={k for k in keys if self.manager.is_promotion_pending(k)},
+            ready=set(),
+        )
+        for i, key in enumerate(keys):
+            chunk_idx = start_chunk_idx + i
+            first = max(load_start_block_index, chunk_idx * blocks_per_chunk)
+            end = min(end_block_index, (chunk_idx + 1) * blocks_per_chunk)
+            load.src_index[key] = i
+            load.dst_block_ids[key] = dst_block_ids[
+                first - load_start_block_index : end - load_start_block_index
+            ]
+            load.first_block_index[key] = first
+        load.ready = set(keys) - load.pending
+
+        req_status.streaming_load = load
+        self._streaming_loads[req_status.req.request_id] = req_status
+        logger.debug(
+            "Request %s loads %d chunks, %d still being promoted",
+            req_status.req.request_id,
+            len(keys),
+            len(load.pending),
+        )
+        self._issue_ready_pieces(req_status)
+
+    def _issue_ready_pieces(self, req_status: RequestOffloadState) -> None:
+        """Load each run of consecutive ready chunks as one transfer job."""
+        load = req_status.streaming_load
+        assert load is not None
+        run: list[OffloadKey] = []
+        for key in load.keys:
+            if key in load.ready:
+                run.append(key)
+            elif run:
+                self._issue_load_piece(req_status, run)
+                run = []
+        if run:
+            self._issue_load_piece(req_status, run)
+        load.ready.clear()
+
+    def _issue_load_piece(
+        self, req_status: RequestOffloadState, keys: list[OffloadKey]
+    ) -> None:
+        load = req_status.streaming_load
+        assert load is not None
+        src_spec = load.src_spec.select([load.src_index[k] for k in keys])
+        dst_block_ids = [b for k in keys for b in load.dst_block_ids[k]]
+        dst_spec = GPULoadStoreSpec(
+            dst_block_ids,
+            group_sizes=[len(dst_block_ids)],
+            block_indices=[load.first_block_index[keys[0]]],
+        )
+        req_id = req_status.req.request_id
+        job_id = self._generate_job_id()
+        self._current_batch_load_jobs[job_id] = TransferJob(
+            req_id=req_id, src_spec=src_spec, dst_spec=dst_spec, last=False
+        )
+        req_status.transfer_jobs.add(job_id)
+        self._jobs[job_id] = TransferJobStatus(
+            req_id=req_id,
+            pending_count=self.config.num_workers,
+            keys=set(keys),
+            is_store=False,
+        )
+
+    def _advance_streaming_loads(self) -> None:
+        """Load the chunks whose promotion completed since the last step, and
+        end the loads that have nothing left to wait for."""
+        if not self._streaming_loads:
+            return
+        promoted, failed = self.manager.take_promotion_results()
+        promoted_keys = set(promoted)
+        failed_keys = set(failed)
+        for req_status in list(self._streaming_loads.values()):
+            load = req_status.streaming_load
+            assert load is not None
+            lost = load.pending & failed_keys
+            done = load.pending & promoted_keys
+            load.pending -= lost | done
+            load.ready |= done
+            if lost:
+                load.failed = True
+                if self._chunks_being_loaded is not None:
+                    self._chunks_being_loaded.difference_update(lost)
+            if load.failed:
+                self._release_streaming_chunks(req_status)
+            else:
+                self._issue_ready_pieces(req_status)
+            if not load.pending:
+                self._end_streaming_load(req_status)
+
+    def _release_streaming_chunks(self, req_status: RequestOffloadState) -> None:
+        """Drop the pins on the chunks of a failed streaming load that no
+        load piece holds."""
+        load = req_status.streaming_load
+        assert load is not None
+        req_context = req_status.req_context
+        if load.pending:
+            self.manager.cancel_reserved_load(load.pending, req_context)
+        if load.ready:
+            self.manager.complete_load(load.ready, req_context)
+        if self._chunks_being_loaded is not None:
+            self._chunks_being_loaded.difference_update(load.pending | load.ready)
+        load.pending.clear()
+        load.ready.clear()
+
+    def _end_streaming_load(self, req_status: RequestOffloadState) -> None:
+        """Tell the workers the request's load has no more pieces: it is
+        done once those already issued are."""
+        load = req_status.streaming_load
+        assert load is not None and not load.pending and not load.ready
+        req_id = req_status.req.request_id
+        if load.failed:
+            logger.warning(
+                "Request %s: a chunk could not be promoted; recomputing it "
+                "instead of loading it",
+                req_id,
+            )
+        self._load_ends[req_id] = load.failed
+        req_status.streaming_load = None
+        del self._streaming_loads[req_id]
+        if req_status.finished_signaled and not req_status.transfer_jobs:
+            del self._req_status[req_id]
 
     def _record_gpu_local_prefix_access(self, req_status: RequestOffloadState) -> None:
         """Record offload keys represented by the GPU-local prefix.
@@ -1891,6 +2114,7 @@ class OffloadingConnectorScheduler:
             preempted_req_ids=scheduler_output.preempted_req_ids or (),
         )
         self.manager.on_schedule_end(schedule_end_context)
+        self._advance_streaming_loads()
 
         # Flush jobs for preempted requests.
         for req_id in scheduler_output.preempted_req_ids or ():
@@ -1921,6 +2145,7 @@ class OffloadingConnectorScheduler:
             load_jobs=self._current_batch_load_jobs,
             store_jobs=partial_store_jobs | normal_store_jobs,
             jobs_to_flush=self._current_batch_jobs_to_flush,
+            load_ends=self._load_ends,
         )
 
         # All prepare_store calls for finished requests have been issued.
@@ -1931,9 +2156,10 @@ class OffloadingConnectorScheduler:
                 continue
             req_status.finished_signaled = True
             self.manager.on_request_finished(req_status.req_context)
-            if not req_status.transfer_jobs:
+            if not req_status.transfer_jobs and req_status.streaming_load is None:
                 del self._req_status[req_id]
         self._current_batch_load_jobs = {}
+        self._load_ends = {}
         self._current_batch_jobs_to_flush = set()
         self._current_batch_allocated_block_ids = set()
         return meta
@@ -1944,7 +2170,11 @@ class OffloadingConnectorScheduler:
         While True, build_connector_meta() and update_connector_output()
         continue to be called even when no requests are scheduled.
         """
-        return bool(self._jobs) or self.manager.has_pending_work()
+        return (
+            bool(self._jobs)
+            or bool(self._streaming_loads)
+            or self.manager.has_pending_work()
+        )
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """Update KVConnector state from worker-side connectors output.
@@ -2023,7 +2253,11 @@ class OffloadingConnectorScheduler:
 
             del self._jobs[job_id]
             req_status.transfer_jobs.remove(job_id)
-            if req_status.finished_signaled and not req_status.transfer_jobs:
+            if (
+                req_status.finished_signaled
+                and not req_status.transfer_jobs
+                and req_status.streaming_load is None
+            ):
                 del self._req_status[job_status.req_id]
 
     def get_stats(self) -> OffloadingConnectorStats | None:
@@ -2105,6 +2339,13 @@ class OffloadingConnectorScheduler:
 
         # Flush all in-flight jobs
         self._current_batch_jobs_to_flush.update(self._jobs.keys())
+
+        # The reset drops the pins of streaming loads: end them as failed, so
+        # their requests recompute once the pieces already issued are done.
+        for req_id, status in self._streaming_loads.items():
+            status.streaming_load = None
+            self._load_ends[req_id] = True
+        self._streaming_loads.clear()
 
         for req_id, status in list(self._req_status.items()):
             if status.req.is_finished():

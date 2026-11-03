@@ -12,6 +12,7 @@ from tests.v1.kv_connector.unit.offloading_connector.test_config import (
     _make_vllm_config,
 )
 from tests.v1.kv_connector.unit.offloading_connector.utils import (
+    MockLoadStoreSpec,
     MockOffloadingSpec,
     generate_store_output,
     to_keys,
@@ -69,6 +70,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingEvent,
     OffloadingKVEventsConfig,
     OffloadingManager,
+    OffloadKey,
     OffloadPolicy,
     ReqContext,
     RequestOffloadingContext,
@@ -1881,10 +1883,12 @@ def _make_scheduler_with_lookup(
         return lookup_results.get(int(block_hash.decode()), default)
 
     manager.lookup.side_effect = lookup
+    manager.is_promotion_pending.return_value = False
 
     scheduler = object.__new__(OffloadingConnectorScheduler)
     scheduler.manager = manager
     scheduler._events_tracker = MagicMock()
+    scheduler._stream_promoted_loads = False
     return scheduler
 
 
@@ -5001,3 +5005,105 @@ class TestMambaHybridOffloadServing:
             False,
         ]
         assert self._roundtrip_served_tokens(scheduler) == 16
+
+
+class _PromotionScript:
+    """Answer every lookup with a chunk being promoted, and complete the
+    promotions as scripted: each take_promotion_results() call promotes, then
+    fails, the given numbers of the next pending chunks, in chunk order."""
+
+    def __init__(self, manager: MagicMock, outcomes: list[tuple[int, int]]):
+        self.outcomes = list(outcomes)
+        self.keys: list[OffloadKey] = []
+        self.promoting: set[OffloadKey] = set()
+        self.promoted: set[OffloadKey] = set()
+        manager.lookup.side_effect = self.lookup
+        manager.is_promotion_pending.side_effect = lambda key: key in self.promoting
+        manager.reserve_load.side_effect = self.reserve_load
+        manager.take_promotion_results.side_effect = self.take
+
+    def lookup(self, key, req_context):
+        if key in self.promoted:
+            return LookupResult.HIT
+        self.promoting.add(key)
+        return LookupResult.HIT_PENDING
+
+    def reserve_load(self, keys, req_context):
+        self.keys = list(keys)
+        return MockLoadStoreSpec(keys)
+
+    def take(self):
+        if not self.outcomes:
+            return [], []
+        num_promoted, num_failed = self.outcomes.pop(0)
+        pending = [k for k in self.keys if k in self.promoting]
+        promoted = pending[:num_promoted]
+        failed = pending[num_promoted : num_promoted + num_failed]
+        self.promoting.difference_update(promoted + failed)
+        self.promoted.update(promoted)
+        return promoted, failed
+
+
+def _store_three_chunks(request_runner, async_scheduling: bool):
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=100,
+        async_scheduling=async_scheduling,
+        kv_load_failure_policy="recompute",
+    )
+    runner.new_request(token_ids=[0] * 12)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0, 1, 2))
+    runner.scheduler.reset_prefix_cache()
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    return runner
+
+
+def _load_jobs(runner) -> list[MockLoadStoreSpec]:
+    return [
+        src
+        for src, _ in runner.offloading_spec.handler.transfer_specs.values()
+        if isinstance(src, MockLoadStoreSpec)
+    ]
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_load_starts_before_its_promotion_completes(
+    request_runner, async_scheduling: bool
+):
+    """A request whose chunks are being promoted is scheduled at once, and its
+    chunks are loaded to GPU in pieces as their promotions complete."""
+    runner = _store_three_chunks(request_runner, async_scheduling)
+    script = _PromotionScript(runner.manager, [(1, 0), (0, 0), (2, 0)])
+
+    runner.new_request(token_ids=[0] * 12 + [1])
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(0, 1, 2))
+
+    runner.manager.reserve_load.assert_called_once()
+    pieces = [src.offload_keys for src in _load_jobs(runner)]
+    assert pieces == [script.keys[:1], script.keys[1:]]
+    runner.manager.cancel_reserved_load.assert_not_called()
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_failed_promotion_recomputes_the_request(
+    request_runner, async_scheduling: bool
+):
+    """A failed promotion releases the chunks still pending, and the request
+    recomputes after the pieces already issued are done."""
+    runner = _store_three_chunks(request_runner, async_scheduling)
+    script = _PromotionScript(runner.manager, [(1, 0), (0, 1)])
+
+    runner.new_request(token_ids=[0] * 12 + [1])
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(0,))
+
+    assert [src.offload_keys for src in _load_jobs(runner)] == [script.keys[:1]]
+    runner.manager.cancel_reserved_load.assert_called_once()
+    assert set(runner.manager.cancel_reserved_load.call_args.args[0]) == {
+        script.keys[2]
+    }
+    assert not runner.connector_scheduler._streaming_loads

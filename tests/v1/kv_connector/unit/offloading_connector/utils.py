@@ -77,6 +77,9 @@ class MockLoadStoreSpec(LoadStoreSpec):
     def __repr__(self) -> str:
         return repr(self.offload_keys)
 
+    def select(self, indices) -> "MockLoadStoreSpec":
+        return MockLoadStoreSpec([self.offload_keys[i] for i in indices])
+
 
 class MockOffloadingWorker(OffloadingWorker):
     def __init__(self):
@@ -184,6 +187,7 @@ class RequestRunner:
         worker_count: int = 1,
         retention_interval: int | None = None,
         speculative_config: Any | None = None,
+        kv_load_failure_policy: str = "fail",
     ):
         assert blocks_per_chunk == 1 or kv_cache_groups is None, (
             "blocks_per_chunk > 1 requires all groups to have the same "
@@ -226,6 +230,7 @@ class RequestRunner:
             kv_connector="OffloadingConnector",
             kv_role="kv_both",
             kv_connector_extra_config=extra_config,
+            kv_load_failure_policy=kv_load_failure_policy,
         )
         vllm_config.kv_events_config = KVEventsConfig(
             # Enable so the offloading events tracker is active, but use the
@@ -520,9 +525,11 @@ class RequestRunner:
                 self.offloading_spec.complete_transfers()
 
             self.worker_connector.wait_for_save()
-            finished_sending, finished_recving = self.worker_connector.get_finished(
+            transfer_results = self.worker_connector.get_transfer_results(
                 scheduler_output.finished_req_ids
             )
+            finished_sending = transfer_results.finished_sending
+            finished_recving = transfer_results.finished_recving
             worker_meta = (
                 self.worker_connector.build_connector_worker_meta()
                 or OffloadingWorkerMetadata()
@@ -534,6 +541,7 @@ class RequestRunner:
                 reqs=self.scheduler.running,
                 finished_sending=finished_sending,
                 finished_recving=finished_recving,
+                failed_recving=transfer_results.failed_recving,
                 token_id=token_id or 0,
                 kv_connector_worker_meta=worker_meta,
             )
@@ -684,6 +692,7 @@ def request_runner():
         worker_count=1,
         retention_interval=None,
         speculative_config=None,
+        kv_load_failure_policy="fail",
     ):
         runner = RequestRunner(
             block_size=block_size,
@@ -695,6 +704,7 @@ def request_runner():
             worker_count=worker_count,
             retention_interval=retention_interval,
             speculative_config=speculative_config,
+            kv_load_failure_policy=kv_load_failure_policy,
         )
         runners.append(runner)
         return runner

@@ -60,6 +60,12 @@ class OffloadingConnectorWorker:
 
         # job_id -> req_id for in-flight loads.
         self._load_jobs: dict[int, ReqId] = {}
+        # Loads streamed in pieces: req_id -> pieces in flight, and the ended
+        # ones (True if failed). A streamed load is done once it has ended and
+        # its pieces are.
+        self._load_pieces_in_flight: dict[ReqId, int] = {}
+        self._ended_loads: dict[ReqId, bool] = {}
+        self._failed_recving: set[ReqId] = set()
         self._unsubmitted_store_jobs: list[
             tuple[int, GPULoadStoreSpec, LoadStoreSpec]
         ] = []
@@ -252,9 +258,14 @@ class OffloadingConnectorWorker:
 
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
+            if not entry.last:
+                self._load_pieces_in_flight[entry.req_id] = (
+                    self._load_pieces_in_flight.get(entry.req_id, 0) + 1
+                )
             assert isinstance(entry.dst_spec, GPULoadStoreSpec)
             success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
             assert success
+        self._ended_loads.update(metadata.load_ends)
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():
@@ -302,10 +313,29 @@ class OffloadingConnectorWorker:
 
             self._connector_worker_meta.mark_completed(job_id)
             req_id = self._load_jobs.pop(job_id, None)
-            if req_id is not None:
+            if req_id is None:
+                continue
+            if req_id in self._load_pieces_in_flight:
+                self._load_pieces_in_flight[req_id] -= 1
+                if self._load_pieces_in_flight[req_id] == 0:
+                    del self._load_pieces_in_flight[req_id]
+            else:
                 finished_recving.add(req_id)
 
+        for req_id in [
+            r for r in self._ended_loads if r not in self._load_pieces_in_flight
+        ]:
+            finished_recving.add(req_id)
+            if self._ended_loads.pop(req_id):
+                self._failed_recving.add(req_id)
+
         return set(), finished_recving
+
+    def take_failed_recving(self) -> set[ReqId]:
+        """Requests whose streamed load failed since the last call; they are
+        also in the finished_recving returned by get_finished()."""
+        failed, self._failed_recving = self._failed_recving, set()
+        return failed
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         """Return completed transfer job IDs since the last call."""
@@ -318,6 +348,8 @@ class OffloadingConnectorWorker:
     def shutdown(self) -> None:
         self._unsubmitted_store_jobs.clear()
         self._load_jobs.clear()
+        self._load_pieces_in_flight.clear()
+        self._ended_loads.clear()
         self._connector_worker_meta = OffloadingWorkerMetadata()
         if self.worker is not None:
             self.worker.shutdown()

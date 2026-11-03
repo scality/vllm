@@ -62,6 +62,9 @@ class TransferJob:
     req_id: ReqId
     src_spec: LoadStoreSpec
     dst_spec: LoadStoreSpec
+    # False for a piece of a load streamed in several jobs: the request's load
+    # is done only once its end is announced in load_ends and every piece is.
+    last: bool = True
 
 
 @dataclass
@@ -70,6 +73,9 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
     load_jobs: dict[int, TransferJob]
     store_jobs: dict[int, TransferJob]
     jobs_to_flush: set[int] | None = None
+    # Streamed loads that have no more pieces to come, by request ID: True if
+    # the load failed and the request must recompute instead.
+    load_ends: dict[ReqId, bool] = field(default_factory=dict)
 
 
 @dataclass

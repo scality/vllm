@@ -77,6 +77,10 @@ class CPUOffloadingManager(OffloadingManager):
         self._num_evictable_cache_chunks: int = 0
         # Track chunks with an in-flight store (ref_cnt -1, not yet completed).
         self._num_write_pending_chunks: int = 0
+        # Loads reserved on a chunk whose store is in flight: key -> number of
+        # loads. complete_store() turns them into read references, so the chunk
+        # can't be evicted between its store and these loads.
+        self._reserved_loads: dict[OffloadKey, int] = {}
 
         self.store_threshold: int = store_threshold
         self.max_tracker_size: int = max_tracker_size
@@ -229,6 +233,46 @@ class CPUOffloadingManager(OffloadingManager):
         if record_access:
             self._record_request_cache_access(keys, req_context, reused_keys=keys)
         return self._get_load_store_spec(keys, chunks)
+
+    def reserve_load(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> CPULoadStoreSpec:
+        """Pin chunks for a load, including chunks whose store is in flight.
+
+        A ready chunk gets its read reference now, as with prepare_load(). A
+        chunk still being stored gets it when the store completes; if the store
+        fails, the chunk is dropped along with its reservations, and the caller
+        must not load it nor call complete_load() for it.
+        """
+        chunks = []
+        ready_keys = []
+        for key in keys:
+            chunk = self._policy.get(key)
+            assert chunk is not None, f"Chunk {key!r} not found in cache"
+            if chunk.is_ready:
+                ready_keys.append(key)
+            else:
+                self._reserved_loads[key] = self._reserved_loads.get(key, 0) + 1
+            chunks.append(chunk)
+        if ready_keys:
+            self._prepare_load(ready_keys, req_context, record_access=True)
+        return self._get_load_store_spec(keys, chunks)
+
+    def has_reserved_load(self, key: OffloadKey) -> bool:
+        return key in self._reserved_loads
+
+    def cancel_reserved_load(self, keys: Collection[OffloadKey]) -> None:
+        """Drop reservations taken by reserve_load() on chunks still being
+        stored."""
+        for key in keys:
+            count = self._reserved_loads.get(key, 0)
+            assert count > 0, f"Chunk {key!r} has no reserved load"
+            if count == 1:
+                del self._reserved_loads[key]
+            else:
+                self._reserved_loads[key] = count - 1
 
     @override
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
@@ -387,15 +431,17 @@ class CPUOffloadingManager(OffloadingManager):
             for key in keys:
                 chunk = self._policy.get(key)
                 if chunk is not None and not chunk.is_ready:
-                    chunk.ref_cnt = 0
                     self._num_write_pending_chunks -= 1
-                    self._num_evictable_cache_chunks += 1
-                    self._policy.mark_evictable(key)
+                    chunk.ref_cnt = self._reserved_loads.pop(key, 0)
+                    if chunk.ref_cnt == 0:
+                        self._num_evictable_cache_chunks += 1
+                        self._policy.mark_evictable(key)
                     stored_keys.append(key)
         else:
             for key in keys:
                 chunk = self._policy.get(key)
                 if chunk is not None and not chunk.is_ready:
+                    self._reserved_loads.pop(key, None)
                     self._num_write_pending_chunks -= 1
                     self._policy.remove(key)
                     self._free_chunk(chunk)
@@ -449,6 +495,7 @@ class CPUOffloadingManager(OffloadingManager):
         self._cache_generation += 1
         self._num_evictable_cache_chunks = 0
         self._num_write_pending_chunks = 0
+        self._reserved_loads.clear()
 
         self._free_list.clear()
         self._num_allocated_chunks = 0

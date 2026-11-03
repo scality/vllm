@@ -154,6 +154,12 @@ class LoadStoreSpec:
     to load, and optionally also to store, blocks of KV data.
     """
 
+    def select(self, indices: Sequence[int]) -> "LoadStoreSpec":
+        """The spec of the chunks at these positions of this spec, in this
+        order. Needed only from the source spec of a load loaded in pieces,
+        as returned by OffloadingManager.reserve_load()."""
+        raise NotImplementedError
+
 
 @dataclass
 class PrepareStoreOutput:
@@ -408,6 +414,32 @@ class OffloadingManager(ABC):
 
         """
         return ()
+
+    def is_promotion_pending(self, key: OffloadKey) -> bool:
+        """Whether a HIT_PENDING key is pending because it is being promoted
+        from a lower tier, which reserve_load() can wait for."""
+        return False
+
+    def reserve_load(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> LoadStoreSpec:
+        """Like prepare_load(), but also for keys whose promotion is pending:
+        those are pinned when their promotion completes. Only called by a
+        manager whose is_promotion_pending() can return True."""
+        raise NotImplementedError
+
+    def cancel_reserved_load(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        """Drop what reserve_load() took on keys whose promotion has not
+        completed yet."""
+        raise NotImplementedError
+
+    def take_promotion_results(
+        self,
+    ) -> tuple[Collection[OffloadKey], Collection[OffloadKey]]:
+        """Keys whose promotion succeeded and failed since the last call."""
+        return (), ()
 
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
         """Called once at the end of each scheduler step.

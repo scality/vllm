@@ -15,6 +15,12 @@ Configuration via kv_connector_extra_config:
   - cache_policy_module_path: (optional) Python import path to load
     eviction_policy from when it names an out-of-tree CachePolicy not
     registered via CachePolicyFactory
+  - promotion_slice_chunks: (optional) Promote a request's chunks from a
+    secondary tier in jobs of at most this many chunks, and start loading each
+    job's chunks to GPU as soon as it completes instead of after the last one.
+    Requires kv_load_failure_policy="recompute": a request is then scheduled
+    before its chunks are read, so a failed read means recomputing it.
+    0 (default) promotes a request's chunks in one job, loaded once complete.
   - secondary_tiers: (optional) List of secondary tier configurations
     Each secondary tier config is a dict with:
       - type: (required) Type of secondary tier (e.g., "example", "fs",
@@ -387,6 +393,9 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 tiering_manager = TieringOffloadingManager(
                     primary_tier=primary_tier,
                     secondary_tiers=secondary_tiers,
+                    promotion_slice_chunks=int(
+                        self.extra_config.get("promotion_slice_chunks", 0)
+                    ),
                 )
                 self._manager = tiering_manager
             except Exception:

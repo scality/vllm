@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Sequence
+
 import numpy as np
 
 from vllm.v1.kv_offload.base import BlockIDsLoadStoreSpec
@@ -24,3 +26,6 @@ class CPULoadStoreSpec(BlockIDsLoadStoreSpec):
     @property
     def chunk_ids(self) -> np.ndarray:
         return self.block_ids
+
+    def select(self, indices: Sequence[int]) -> "CPULoadStoreSpec":
+        return CPULoadStoreSpec(self.block_ids[list(indices)].tolist())
