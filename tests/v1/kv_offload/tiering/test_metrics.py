@@ -224,3 +224,42 @@ def test_tiering_metrics_tracker_records_promotion_allocation_failures():
     assert stats is not None
     values = stats.data["data"]
     assert values[TieringOffloadingMetrics.PROMOTION_ALLOCATION_FAILURES][()] == 1
+
+
+def test_tiering_metrics_tracker_times_a_request_read_once(monkeypatch):
+    """A request read in several promotion jobs running at once is observed
+    once, from its first job's submission to its last job's completion."""
+    now = [10.0]
+    monkeypatch.setattr(
+        "vllm.v1.kv_offload.tiering.metrics.time.monotonic", lambda: now[0]
+    )
+    tracker = TieringMetricsTracker(
+        tier_types=["obj"],
+        num_primary_chunks=5,
+        primary_chunk_size=16,
+    )
+    other = ReqContext(req_id="other")
+    jobs = [
+        JobMetadata(TransferJob(0, to_keys([0]), np.array([0]), True, _CTX), 0),
+        JobMetadata(TransferJob(1, to_keys([1]), np.array([1]), True, _CTX), 0),
+        JobMetadata(TransferJob(2, to_keys([2]), np.array([2]), True, other), 0),
+    ]
+    for job in jobs:
+        tracker.on_job_registered(job)
+
+    now[0] = 10.03
+    tracker.on_job_finished(jobs[0], JobResult(0, success=True, transfer_time=0.03))
+    now[0] = 10.05
+    tracker.on_job_finished(jobs[2], JobResult(2, success=True, transfer_time=0.05))
+    now[0] = 10.06
+    tracker.on_job_finished(jobs[1], JobResult(1, success=True, transfer_time=0.06))
+
+    stats = tracker.take_stats()
+    assert stats is not None
+    values = stats.data["data"]
+    label = ("1:obj",)
+    assert values[TieringOffloadingMetrics.REQUEST_READ_TIME][label] == pytest.approx(
+        [0.05, 0.06]
+    )
+    assert values[TieringOffloadingMetrics.READ_TIME][label] == pytest.approx(0.14)
+    tracker.assert_idle()

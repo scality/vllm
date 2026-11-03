@@ -165,6 +165,31 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             ),
             labelnames=("tier",),
         )
+        metrics[TieringOffloadingMetrics.REQUEST_READ_TIME] = (
+            OffloadingHistogramMetadata(
+                documentation=(
+                    "Histogram of wall-clock time to read a request's chunks from "
+                    "a secondary tier into the primary tier, from its first "
+                    "promotion job submitted to its last one completed, labeled "
+                    "by tier, in seconds. Unlike read_time, which adds up the "
+                    "duration of each job, jobs running at once count once."
+                ),
+                labelnames=("tier",),
+                buckets=(
+                    0.001,
+                    0.005,
+                    0.01,
+                    0.025,
+                    0.05,
+                    0.1,
+                    0.25,
+                    0.5,
+                    1,
+                    5,
+                    10,
+                ),
+            )
+        )
         metrics[TieringOffloadingMetrics.WRITE_BYTES] = OffloadingCounterMetadata(
             documentation=(
                 "Total bytes written from the primary tier to secondary tiers, "

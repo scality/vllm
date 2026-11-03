@@ -55,6 +55,9 @@ class TieringMetricsTracker:
         self._num_primary_chunks = num_primary_chunks
         self._primary_chunk_size = primary_chunk_size
         self._request_states: dict[str, _RequestMetricsState] = {}
+        # (req_id, tier_idx) -> [start time of the request's first promotion
+        # job still running, number of its promotion jobs running].
+        self._request_reads: dict[tuple[str, int], list[float]] = {}
         self._tier_states = [_TierState() for _ in tier_types]
         self._stats = OffloadingConnectorStats()
 
@@ -116,6 +119,9 @@ class TieringMetricsTracker:
         if transfer_job.is_promotion:
             state.active_promotion_count += 1
             state.primary_write_chunk_count += chunk_count
+            read_key = (transfer_job.req_context.req_id, job_metadata.tier_idx)
+            read = self._request_reads.setdefault(read_key, [time.monotonic(), 0])
+            read[1] += 1
         else:
             state.active_cascade_count += 1
             state.primary_read_chunk_count += chunk_count
@@ -124,7 +130,26 @@ class TieringMetricsTracker:
         self, job_metadata: _JobMetadataLike, result: JobResult
     ) -> None:
         self._observe_finished_job_stats(job_metadata, result)
+        self._observe_request_read(job_metadata)
         self._decrement_tier_state(job_metadata)
+
+    def _observe_request_read(self, job_metadata: _JobMetadataLike) -> None:
+        """Observe a request's read time once its last promotion job from a
+        tier finishes."""
+        transfer_job = job_metadata.transfer_job
+        if not transfer_job.is_promotion:
+            return
+        read_key = (transfer_job.req_context.req_id, job_metadata.tier_idx)
+        read = self._request_reads[read_key]
+        read[1] -= 1
+        if read[1] > 0:
+            return
+        del self._request_reads[read_key]
+        self._stats.observe_histogram(
+            TieringOffloadingMetrics.REQUEST_READ_TIME,
+            time.monotonic() - read[0],
+            self.tier_label(job_metadata.tier_idx),
+        )
 
     def on_promotion_allocation_failure(self) -> None:
         self._stats.increase_counter(
@@ -184,6 +209,7 @@ class TieringMetricsTracker:
             and state.primary_read_chunk_count == 0
             for state in self._tier_states
         )
+        assert not self._request_reads
 
     def _decrement_tier_state(self, job_metadata: _JobMetadataLike) -> None:
         transfer_job = job_metadata.transfer_job

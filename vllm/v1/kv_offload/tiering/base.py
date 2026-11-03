@@ -44,6 +44,7 @@ class TieringOffloadingMetrics:
     LOOKUP_ASYNC_DELAY = "vllm:kv_offload_tiering_lookup_async_delay_seconds"
     READ_BYTES = "vllm:kv_offload_tiering_read_bytes"
     READ_TIME = "vllm:kv_offload_tiering_read_time"
+    REQUEST_READ_TIME = "vllm:kv_offload_tiering_request_read_time_seconds"
     WRITE_BYTES = "vllm:kv_offload_tiering_write_bytes"
     WRITE_TIME = "vllm:kv_offload_tiering_write_time"
     PROMOTION_JOB_FAILURES = "vllm:kv_offload_tiering_promotion_job_failures"
