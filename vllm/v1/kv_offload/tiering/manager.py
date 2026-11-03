@@ -585,7 +585,9 @@ class TieringOffloadingManager(OffloadingManager):
             LoadStoreSpec for reading from primary tier.
 
         """
-        return self.primary_tier.prepare_load(keys, req_context)
+        spec = self.primary_tier.prepare_load(keys, req_context)
+        self.record_access(keys, req_context)
+        return spec
 
     @override
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext):
@@ -599,6 +601,15 @@ class TieringOffloadingManager(OffloadingManager):
         self.primary_tier.touch(keys, req_context)
         for tier in self.secondary_tiers:
             tier.touch(keys, req_context)
+
+    @override
+    def record_access(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        """Record a request-scoped access in all tiers."""
+        self.primary_tier.record_access(keys, req_context)
+        for tier in self.secondary_tiers:
+            tier.record_access(keys, req_context)
 
     @override
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):

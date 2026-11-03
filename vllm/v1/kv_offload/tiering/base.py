@@ -292,6 +292,21 @@ class SecondaryTierManager(ABC):
         """
         return
 
+    def record_access(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        """Record chunks a request reused from the GPU or the primary tier.
+
+        Such hits never reach this tier's ``lookup``; tiers that keep their
+        own recency use this call to see them.
+
+        Args:
+            keys: Offload keys reused by the request.
+            req_context: Per-request context.
+
+        """
+        return
+
     @abstractmethod
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         """Called when a new request is first seen by the scheduler.
