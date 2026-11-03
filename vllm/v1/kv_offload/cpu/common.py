@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -28,6 +29,9 @@ class CPULoadStoreSpec(BlockIDsLoadStoreSpec):
     @property
     def chunk_ids(self) -> np.ndarray:
         return self.block_ids
+
+    def select(self, indices: Sequence[int]) -> "CPULoadStoreSpec":
+        return CPULoadStoreSpec(self.block_ids[list(indices)].tolist())
 
 
 @dataclass(frozen=True)

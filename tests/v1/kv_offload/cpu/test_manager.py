@@ -1869,3 +1869,50 @@ def test_lru_insert_orders_positioned_chunks_without_followup_access(ready_on_in
     assert evicted is not None
     assert [key for key, _ in evicted] == [tail, middle]
     assert policy.get(head) is not None
+
+
+def test_reserved_load_pins_a_chunk_once_its_store_completes():
+    """A load reserved on a chunk still being stored pins it when the store
+    completes, so it is never evictable in between."""
+    manager = make_cpu_manager(num_chunks=4)
+    manager.prepare_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([1]), _EMPTY_REQ_CTX)
+
+    # 1 is ready, 2 is still being stored.
+    spec = manager.reserve_load(to_keys([1, 2]), _EMPTY_REQ_CTX)
+    assert len(spec.block_ids) == 2
+    assert manager._policy.get(to_key(1)).ref_cnt == 1
+    assert not manager._policy.get(to_key(2)).is_ready
+    assert manager._num_evictable_cache_chunks == 0
+
+    manager.complete_store(to_keys([2]), _EMPTY_REQ_CTX)
+    assert manager._policy.get(to_key(2)).ref_cnt == 1
+    assert manager._num_evictable_cache_chunks == 0
+
+    manager.complete_load(to_keys([1, 2]), _EMPTY_REQ_CTX)
+    assert manager._num_evictable_cache_chunks == 2
+
+
+def test_reserved_load_is_dropped_with_a_failed_store():
+    manager = make_cpu_manager(num_chunks=4)
+    manager.prepare_store(to_keys([1]), _EMPTY_REQ_CTX)
+    manager.reserve_load(to_keys([1]), _EMPTY_REQ_CTX)
+    assert manager.has_reserved_load(to_key(1))
+
+    manager.complete_store(to_keys([1]), _EMPTY_REQ_CTX, success=False)
+    assert not manager.has_reserved_load(to_key(1))
+    assert manager._policy.get(to_key(1)) is None
+
+
+def test_cancelled_reserved_load_leaves_the_stored_chunk_evictable():
+    manager = make_cpu_manager(num_chunks=4)
+    manager.prepare_store(to_keys([1]), _EMPTY_REQ_CTX)
+    manager.reserve_load(to_keys([1]), _EMPTY_REQ_CTX)
+    manager.reserve_load(to_keys([1]), _EMPTY_REQ_CTX)
+
+    manager.cancel_reserved_load(to_keys([1]))
+    manager.complete_store(to_keys([1]), _EMPTY_REQ_CTX)
+    assert manager._policy.get(to_key(1)).ref_cnt == 1
+
+    manager.complete_load(to_keys([1]), _EMPTY_REQ_CTX)
+    assert manager._num_evictable_cache_chunks == 1

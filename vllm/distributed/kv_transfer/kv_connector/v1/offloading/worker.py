@@ -61,6 +61,13 @@ class OffloadingConnectorWorker:
 
         # job_id -> req_id for in-flight loads (None for sync loads).
         self._load_jobs: dict[int, ReqId | None] = {}
+        # Loads streamed in pieces: req_id -> pieces in flight, and the ended
+        # ones (True if failed). A streamed load is done once it has ended and
+        # its pieces are.
+        self._load_pieces_in_flight: dict[ReqId, int] = {}
+        self._ended_loads: dict[ReqId, bool] = {}
+        # Streamed loads with a failed piece, reported once the load is done.
+        self._failed_streamed_loads: set[ReqId] = set()
         self._failed_recving: set[ReqId] = set()
         self._unsubmitted_store_jobs: list[
             tuple[int, GPULoadStoreSpec, LoadStoreSpec]
@@ -269,10 +276,15 @@ class OffloadingConnectorWorker:
                 )
             else:
                 self._load_jobs[job_id] = entry.req_id
+                if not entry.last:
+                    self._load_pieces_in_flight[entry.req_id] = (
+                        self._load_pieces_in_flight.get(entry.req_id, 0) + 1
+                    )
                 success = self.worker.submit_load(job_id, entry.src_spec, device_ptrs)
             assert success
         if sync_job_ids:
             self.worker.wait(sync_job_ids)
+        self._ended_loads.update(metadata.load_ends)
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():
@@ -311,8 +323,11 @@ class OffloadingConnectorWorker:
                     # which failed_recving cannot undo.
                     raise RuntimeError(f"KV offload sync load job {job_id} failed")
                 if req_id is not None:
-                    self._failed_recving.add(req_id)
-                    finished_recving.add(req_id)
+                    if self._finish_load_piece(req_id):
+                        self._failed_streamed_loads.add(req_id)
+                    else:
+                        self._failed_recving.add(req_id)
+                        finished_recving.add(req_id)
                 continue
             if (
                 transfer_result.transfer_time is not None
@@ -329,10 +344,30 @@ class OffloadingConnectorWorker:
 
             self._connector_worker_meta.mark_completed(job_id)
             req_id = self._load_jobs.pop(job_id, None)
-            if req_id is not None:
+            if req_id is not None and not self._finish_load_piece(req_id):
                 finished_recving.add(req_id)
 
+        for req_id in [
+            r for r in self._ended_loads if r not in self._load_pieces_in_flight
+        ]:
+            finished_recving.add(req_id)
+            failed = self._ended_loads.pop(req_id)
+            if req_id in self._failed_streamed_loads:
+                self._failed_streamed_loads.discard(req_id)
+                failed = True
+            if failed:
+                self._failed_recving.add(req_id)
+
         return set(), finished_recving
+
+    def _finish_load_piece(self, req_id: ReqId) -> bool:
+        """Count down a streamed load's piece; False if not a streamed load."""
+        if req_id not in self._load_pieces_in_flight:
+            return False
+        self._load_pieces_in_flight[req_id] -= 1
+        if self._load_pieces_in_flight[req_id] == 0:
+            del self._load_pieces_in_flight[req_id]
+        return True
 
     def take_failed_recving(self) -> set[ReqId]:
         """Drain the requests whose load failed since the last call."""
@@ -351,6 +386,9 @@ class OffloadingConnectorWorker:
         self._unsubmitted_store_jobs.clear()
         self._load_jobs.clear()
         self._failed_recving.clear()
+        self._load_pieces_in_flight.clear()
+        self._ended_loads.clear()
+        self._failed_streamed_loads.clear()
         self._connector_worker_meta = OffloadingWorkerMetadata()
         if self.worker is not None:
             self.worker.shutdown()

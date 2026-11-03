@@ -787,7 +787,9 @@ def test_pending_promotion_captures_payload_before_inventory(history, success):
     primary = CPUOffloadingManager(num_chunks=1, enable_events=True)
     ctx = ReqContext(req_id="promotion")
     primary.prepare_store([key], ctx)
-    scheduler = SimpleNamespace(manager=primary, _events_tracker=tracker)
+    scheduler = SimpleNamespace(
+        manager=primary, _events_tracker=tracker, _can_stream=lambda key: False
+    )
     assert (
         OffloadingConnectorScheduler._maximal_prefix_lookup(
             scheduler, [key], ctx, req, group, 0
@@ -844,7 +846,9 @@ def test_failed_pending_chunk_does_not_remove_shared_ready_prefix():
     assert stored.block_hashes == [_wire_hash(_hash(0)), _wire_hash(_hash(1))]
 
     primary.prepare_store([failed_key], ctx)
-    scheduler = SimpleNamespace(manager=primary, _events_tracker=tracker)
+    scheduler = SimpleNamespace(
+        manager=primary, _events_tracker=tracker, _can_stream=lambda key: False
+    )
     assert (
         OffloadingConnectorScheduler._maximal_prefix_lookup(
             scheduler, [failed_key], ctx, failed_req, group, 0
@@ -866,7 +870,9 @@ def test_failed_pending_retry_preserves_replacement_metadata(success):
     key = make_offload_key(_hash(0), 0)
     primary = CPUOffloadingManager(num_chunks=1, enable_events=True)
     ctx = ReqContext(req_id="retry")
-    scheduler = SimpleNamespace(manager=primary, _events_tracker=tracker)
+    scheduler = SimpleNamespace(
+        manager=primary, _events_tracker=tracker, _can_stream=lambda key: False
+    )
     for attempt in range(2):
         primary.prepare_store([key], ctx)
         assert (

@@ -280,6 +280,7 @@ class TieringOffloadingManager(OffloadingManager):
         primary_tier: CPUPrimaryTierOffloadingManager,
         secondary_tiers: list[SecondaryTierManager] | None = None,
         tier_poll_interval_s: float = DEFAULT_TIER_POLL_INTERVAL_S,
+        promotion_slice_chunks: int = 0,
     ):
         """Initialize the TieringOffloadingManager.
 
@@ -291,6 +292,10 @@ class TieringOffloadingManager(OffloadingManager):
                 tiers that set tolerates_off_thread_polling. Zero or negative
                 disables the thread, leaving those tiers serviced once per
                 engine step as before.
+            promotion_slice_chunks: Split a request's promotion into jobs of
+                            at most this many chunks, so its first chunks
+                            complete, and can be loaded to GPU, before the
+                            last ones. 0 submits one job per request.
 
         """
         # Guards this manager and every tier it composes, the primary tier
@@ -299,6 +304,14 @@ class TieringOffloadingManager(OffloadingManager):
         self._lock = threading.Lock()
         self.primary_tier: CPUPrimaryTierOffloadingManager = primary_tier
         self.secondary_tiers = secondary_tiers or []
+        self._promotion_slice_chunks = promotion_slice_chunks
+
+        # Keys whose promotion is allocated in the primary tier and not yet
+        # completed, and the outcome of the promotions a load was reserved on,
+        # completed since the last take_promotion_results().
+        self._promoting: set[OffloadKey] = set()
+        self._promoted_keys: list[OffloadKey] = []
+        self._failed_promotion_keys: list[OffloadKey] = []
 
         self._job_id_counter: int = 0
         # Job tracking: maps job_id to metadata for all in-flight transfers.
@@ -564,6 +577,15 @@ class TieringOffloadingManager(OffloadingManager):
                 if load_sources.get(key) == source:
                     del load_sources[key]
 
+        # Only a load reserved on a chunk waits for its promotion's outcome;
+        # complete_write() turns the reservation into a read reference.
+        if self._promotion_slice_chunks > 0:
+            self._promoted_keys.extend(
+                k for k in successful_keys if self.primary_tier.has_reserved_load(k)
+            )
+            self._failed_promotion_keys.extend(
+                k for k in failed_keys if self.primary_tier.has_reserved_load(k)
+            )
         if successful_keys:
             self.primary_tier.complete_write(
                 successful_keys,
@@ -587,6 +609,7 @@ class TieringOffloadingManager(OffloadingManager):
                 transfer_job.req_context,
                 False,
             )
+        self._promoting.difference_update(transfer_job.keys)
 
     def _process_finished_jobs(
         self,
@@ -833,6 +856,7 @@ class TieringOffloadingManager(OffloadingManager):
         source = self.secondary_tiers[tier_idx].cache_hit_source
         for promoted_key in primary_write_result.keys_to_store:
             load_sources[promoted_key] = source
+        self._promoting.update(primary_write_result.keys_to_store)
         # Defer submit_load to on_schedule_end(). Group by (tier, request) so
         # each request's chunks are submitted as one batched job per tier.
         tier_pending = self._pending_load_submissions.setdefault(tier_idx, {})
@@ -858,16 +882,19 @@ class TieringOffloadingManager(OffloadingManager):
         for tier_idx, pending_by_ctx in self._pending_load_submissions.items():
             tier = self.secondary_tiers[tier_idx]
             for entry in pending_by_ctx.values():
-                job_id = self._next_job_id()
-                job_metadata = TransferJob(
-                    job_id=job_id,
-                    keys=entry.keys,
-                    chunk_ids=np.array(entry.chunk_ids, dtype=np.int32),
-                    is_promotion=True,
-                    req_context=entry.req_context,
-                )
-                self._register_job(job_metadata, tier_idx)
-                tier.submit_load(job_metadata)
+                slice_len = self._promotion_slice_chunks or len(entry.keys)
+                for start in range(0, len(entry.keys), slice_len):
+                    end = start + slice_len
+                    job_id = self._next_job_id()
+                    job_metadata = TransferJob(
+                        job_id=job_id,
+                        keys=entry.keys[start:end],
+                        chunk_ids=np.array(entry.chunk_ids[start:end], dtype=np.int32),
+                        is_promotion=True,
+                        req_context=entry.req_context,
+                    )
+                    self._register_job(job_metadata, tier_idx)
+                    tier.submit_load(job_metadata)
 
         self._pending_load_submissions.clear()
 
@@ -894,6 +921,41 @@ class TieringOffloadingManager(OffloadingManager):
         spec = self.primary_tier.prepare_load(keys, req_context)
         self.record_access(keys, req_context)
         return spec
+
+    @override
+    def is_promotion_pending(self, key: OffloadKey) -> bool:
+        # Without slices, a request's chunks complete all at once: loading
+        # them as they complete would gain nothing.
+        return self._promotion_slice_chunks > 0 and key in self._promoting
+
+    @override
+    def reserve_load(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> LoadStoreSpec:
+        """Pin chunks for a GPU load, including chunks still being promoted.
+
+        A chunk being promoted gets its read reference when its promotion
+        completes. take_promotion_results() tells which promotions completed
+        and which failed; a failed chunk must be neither loaded nor completed.
+        """
+        spec = self.primary_tier.reserve_load(keys, req_context)
+        for tier in self.secondary_tiers:
+            tier.record_access(keys, req_context)
+        return spec
+
+    @override
+    def cancel_reserved_load(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        self.primary_tier.cancel_reserved_load(keys)
+
+    @override
+    def take_promotion_results(
+        self,
+    ) -> tuple[list[OffloadKey], list[OffloadKey]]:
+        promoted, failed = self._promoted_keys, self._failed_promotion_keys
+        self._promoted_keys, self._failed_promotion_keys = [], []
+        return promoted, failed
 
     @override
     def record_access(
@@ -1293,6 +1355,9 @@ class TieringOffloadingManager(OffloadingManager):
         # called so no tier I/O is touching that memory.
         self._pending_load_submissions.clear()
         self._request_load_sources.clear()
+        self._promoting.clear()
+        self._promoted_keys.clear()
+        self._failed_promotion_keys.clear()
         self._metrics.assert_idle()
 
         finished_req_ids = []

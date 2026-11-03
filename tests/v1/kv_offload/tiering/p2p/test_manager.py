@@ -1188,6 +1188,7 @@ class TestHasPendingWork:
             connector_scheduler.manager = manager
             connector_scheduler._jobs = {}
             connector_scheduler._reset_fence = {}
+            connector_scheduler._streaming_loads = {}
             connector = object.__new__(OffloadingConnector)
             connector.connector_scheduler = connector_scheduler
             scheduler = object.__new__(Scheduler)
@@ -1246,6 +1247,7 @@ class TestHasPendingWork:
             connector_scheduler.manager = manager
             connector_scheduler._jobs = {}
             connector_scheduler._reset_fence = {}
+            connector_scheduler._streaming_loads = {}
             connector = object.__new__(OffloadingConnector)
             connector.connector_scheduler = connector_scheduler
             scheduler = object.__new__(Scheduler)

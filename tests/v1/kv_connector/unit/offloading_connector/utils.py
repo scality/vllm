@@ -79,6 +79,9 @@ class MockLoadStoreSpec(LoadStoreSpec):
     def __repr__(self) -> str:
         return repr(self.offload_keys)
 
+    def select(self, indices) -> "MockLoadStoreSpec":
+        return MockLoadStoreSpec([self.offload_keys[i] for i in indices])
+
 
 class MockOffloadingWorker(OffloadingWorker):
     def __init__(self, gpu_spec_map: dict[int, "GPULoadStoreSpec"]):
@@ -213,6 +216,7 @@ class RequestRunner:
         worker_count: int = 1,
         retention_interval: int | None = None,
         speculative_config: Any | None = None,
+        kv_load_failure_policy: str = "fail",
     ):
         assert blocks_per_chunk == 1 or all(
             group.kv_cache_spec.block_size == block_size
@@ -255,6 +259,7 @@ class RequestRunner:
             kv_connector="OffloadingConnector",
             kv_role="kv_both",
             kv_connector_extra_config=extra_config,
+            kv_load_failure_policy=kv_load_failure_policy,
         )
         vllm_config.num_hash_lookahead_tokens = (
             vllm_config._resolve_num_hash_lookahead_tokens()
@@ -567,6 +572,8 @@ class RequestRunner:
             transfer_results = self.worker_connector.get_transfer_results(
                 scheduler_output.finished_req_ids
             )
+            finished_sending = transfer_results.finished_sending
+            finished_recving = transfer_results.finished_recving
             worker_meta = (
                 self.worker_connector.build_connector_worker_meta()
                 or OffloadingWorkerMetadata()
@@ -732,6 +739,7 @@ def request_runner():
         worker_count=1,
         retention_interval=None,
         speculative_config=None,
+        kv_load_failure_policy="fail",
     ):
         runner = RequestRunner(
             block_size=block_size,
@@ -743,6 +751,7 @@ def request_runner():
             worker_count=worker_count,
             retention_interval=retention_interval,
             speculative_config=speculative_config,
+            kv_load_failure_policy=kv_load_failure_policy,
         )
         runners.append(runner)
         return runner
