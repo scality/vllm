@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -366,6 +366,17 @@ class OffloadingConnectorStats(KVConnectorStats):
         self._types.setdefault(histogram_name, _MetricType.HISTOGRAM)
         histogram_values = self._values.setdefault(histogram_name, {})
         histogram_values.setdefault(labelvalues, []).append(histogram_value)
+
+    def observe_histogram_values(
+        self,
+        histogram_name: str,
+        histogram_values: Iterable[int | float],
+        labelvalues: tuple[str, ...] = (),
+    ) -> None:
+        """Record several observations of one histogram."""
+        self._types.setdefault(histogram_name, _MetricType.HISTOGRAM)
+        values = self._values.setdefault(histogram_name, {})
+        values.setdefault(labelvalues, []).extend(histogram_values)
 
 
 class OffloadPromMetrics(KVConnectorPromMetrics):
