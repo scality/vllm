@@ -5145,7 +5145,7 @@ def test_ring_wait_defers_until_the_prompt_is_stored(
     request_runner, async_scheduling: bool
 ):
     """A ring_wait request waits for the chunks another instance is storing,
-    asking again about the first missing one, then loads them all."""
+    asking again about all the missing ones, then loads them all."""
     runner = _store_three_chunks(request_runner, async_scheduling)
     _ring_with(runner, num_available=1)
 
@@ -5154,7 +5154,9 @@ def test_ring_wait_defers_until_the_prompt_is_stored(
         kv_transfer_params={"ring_wait": {"num_tokens": 13, "timeout_ms": 60000}},
     )
     runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(0, 1, 2))
-    assert runner.manager.requery_misses.call_count >= 2
+    # Each requery covers all the chunks still missing.
+    first = runner.manager.requery_misses.call_args_list[0].args[0]
+    assert len(first) == 2
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])

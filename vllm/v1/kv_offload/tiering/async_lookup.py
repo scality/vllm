@@ -214,16 +214,16 @@ class AsyncLookupManager(ABC):
                 state.phase = LookupPhase.RESOLVED
 
     def requery(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
-        """Ask again about keys resolved as missing, in the next batch: another
-        instance may have stored them since. Results of the earlier query are
-        ignored, by generation. Other keys are skipped."""
+        """Ask about keys in the next batch: again for keys resolved as missing,
+        since another instance may have stored them, and for the first time for
+        keys never looked up. Results of an earlier query are ignored, by
+        generation. Keys found, or whose query is pending, are skipped."""
         for key in keys:
             state = self._lookup_state.get(key)
-            if (
-                state is None
-                or state.phase is not LookupPhase.RESOLVED
-                or state.result is not False
-            ):
+            if state is None:
+                self.lookup(key, req_context)
+                continue
+            if state.phase is not LookupPhase.RESOLVED or state.result is not False:
                 continue
             state.generation = self._next_generation
             self._next_generation += 1

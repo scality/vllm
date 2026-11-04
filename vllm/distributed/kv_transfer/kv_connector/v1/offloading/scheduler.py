@@ -1200,9 +1200,11 @@ class OffloadingConnectorScheduler:
 
         It waits until its hits cover the prompt that instance computed, in
         whole chunks and without its last token, which is always computed here.
-        Meanwhile the first missing chunk is asked about again every
-        _RING_WAIT_REQUERY_INTERVAL. Past the deadline, the request goes on
-        with the hits it has and computes the rest.
+        Meanwhile all the chunks still missing are asked about again every
+        _RING_WAIT_REQUERY_INTERVAL: the prefix lookup stops at the first miss,
+        so asking only about that one would find one more chunk per round.
+        Past the deadline, the request goes on with the hits it has and
+        computes the rest.
         """
         if req_status.ring_wait_tokens is None:
             return False
@@ -1239,9 +1241,13 @@ class OffloadingConnectorScheduler:
             for group_idx in self._full_attention_groups:
                 group_config = self.config.kv_group_configs[group_idx]
                 offload_keys = req_status.group_states[group_idx].offload_keys
-                chunk_idx = have // group_config.tokens_per_chunk
-                if chunk_idx < len(offload_keys):
-                    keys.append(offload_keys[chunk_idx])
+                keys.extend(
+                    offload_keys[
+                        have // group_config.tokens_per_chunk : cdiv(
+                            target, group_config.tokens_per_chunk
+                        )
+                    ]
+                )
             self.manager.requery_misses(keys, req_status.req_context)
             req_status.ring_wait_next_requery = now + _RING_WAIT_REQUERY_INTERVAL
         return True

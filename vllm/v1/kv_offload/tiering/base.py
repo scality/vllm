@@ -296,9 +296,9 @@ class SecondaryTierManager(ABC):
     def requery_misses(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> None:
-        """Forget that these keys were found missing, so the next lookup asks
-        again: another instance may be storing them. Tiers that cache their
-        verdicts implement it.
+        """Ask again about these keys if they were found missing, or for the
+        first time if they were never looked up: another instance may be
+        storing them. Tiers that cache their verdicts implement it.
 
         Args:
             keys: Offload keys to ask about again.

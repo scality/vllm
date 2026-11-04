@@ -356,8 +356,9 @@ def test_requery_asks_again_about_a_missing_key():
     mgr.shutdown()
 
 
-def test_requery_skips_found_and_unknown_keys():
-    mgr = InMemoryLookupManager(existing_keys={_key(1)})
+def test_requery_queries_unknown_keys_and_skips_found_ones():
+    """A key never looked up is queried; a key found is left as is."""
+    mgr = InMemoryLookupManager(existing_keys={_key(1), _key(2)})
     ctx = _ctx()
     mgr.lookup(_key(1), ctx)
     assert _resolve(mgr, _key(1), ctx) is True
@@ -366,5 +367,6 @@ def test_requery_skips_found_and_unknown_keys():
     mgr.requery([_key(1), _key(2)], ctx)
     assert mgr._lookup_state[_key(1)].generation == generation
     assert mgr.lookup(_key(1), ctx) is True
-    assert _key(2) not in mgr._lookup_state
+    assert mgr._lookup_state[_key(2)].phase is LookupPhase.PENDING
+    assert _resolve(mgr, _key(2), ctx) is True
     mgr.shutdown()
