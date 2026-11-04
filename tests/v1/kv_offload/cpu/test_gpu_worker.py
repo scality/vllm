@@ -65,6 +65,30 @@ def test_unpinned_cpu_to_gpu_uses_dma(monkeypatch: pytest.MonkeyPatch) -> None:
     ) is (ops.swap_blocks_batch)
 
 
+@pytest.mark.skipif(not gpu_worker.HAS_TRITON, reason="Requires Triton")
+def test_prefer_triton_copies_large_pages_to_gpu_with_triton(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Large pages take the DMA path by default, and the Triton kernel when it
+    is preferred; stores and pageable host memory stay on DMA either way."""
+    monkeypatch.setattr(gpu_worker.current_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(gpu_worker.current_platform, "is_rocm", lambda: False)
+
+    refs = [[CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=64 * 1024)]]
+    assert gpu_worker._select_swap_blocks_fn(refs, gpu_to_cpu=False) is (
+        ops.swap_blocks_batch
+    )
+    assert gpu_worker._select_swap_blocks_fn(
+        refs, gpu_to_cpu=False, prefer_triton=True
+    ) is not (ops.swap_blocks_batch)
+    assert gpu_worker._select_swap_blocks_fn(
+        refs, gpu_to_cpu=True, prefer_triton=True
+    ) is (ops.swap_blocks_batch)
+    assert gpu_worker._select_swap_blocks_fn(
+        refs, gpu_to_cpu=False, host_memory_is_pinned=False, prefer_triton=True
+    ) is (ops.swap_blocks_batch)
+
+
 def test_worker_shutdown_releases_region_and_runs_both_handlers() -> None:
     """Both directions drain before the worker releases its shared region."""
     worker = CPUOffloadingWorker.__new__(CPUOffloadingWorker)

@@ -15,6 +15,10 @@ Configuration via kv_connector_extra_config:
   - cache_policy_module_path: (optional) Python import path to load
     eviction_policy from when it names an out-of-tree CachePolicy not
     registered via CachePolicyFactory
+  - cpu_to_gpu_copy: (optional) "triton" copies chunks from the primary tier
+    to GPU with the Triton kernel whatever their size, which costs one kernel
+    launch instead of one copy-engine descriptor per block and layer. "auto"
+    (default) uses it only for pages under 28 KiB.
   - promotion_slice_chunks: (optional) Promote a request's chunks from a
     secondary tier in jobs of at most this many chunks, and start loading each
     job's chunks to GPU as soon as it completes instead of after the last one.
@@ -493,6 +497,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 num_cpu_chunks=self.num_chunks,
                 mmap_region=worker_mmap,
                 canonical_layout=self.config.canonical_layout,
+                cpu_to_gpu_copy=self.cpu_to_gpu_copy,
             )
         except Exception:
             worker_mmap.cleanup()

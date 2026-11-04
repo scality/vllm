@@ -136,6 +136,15 @@ class CPUOffloadingSpec(OffloadingSpec):
         self.cache_policy_module_path: str | None = self.extra_config.get(
             "cache_policy_module_path"
         )
+        # "triton" copies CPU->GPU with the Triton kernel whatever the page
+        # size; "auto" uses it only for pages small enough to beat the copy
+        # engine on the GPU it was tuned on.
+        self.cpu_to_gpu_copy: str = self.extra_config.get("cpu_to_gpu_copy", "auto")
+        if self.cpu_to_gpu_copy not in ("auto", "triton"):
+            raise ValueError(
+                "cpu_to_gpu_copy must be 'auto' or 'triton', got "
+                f"{self.cpu_to_gpu_copy!r}"
+            )
 
     @override
     def get_manager(self) -> OffloadingManager:
@@ -190,6 +199,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 blocks_per_chunk=self.blocks_per_chunk,
                 num_cpu_chunks=self.num_chunks,
                 mmap_region=mmap_region,
+                cpu_to_gpu_copy=self.cpu_to_gpu_copy,
             )
         except Exception:
             if mmap_region is not None:

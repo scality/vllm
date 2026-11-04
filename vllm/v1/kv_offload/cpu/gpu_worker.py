@@ -40,8 +40,13 @@ def _select_swap_blocks_fn(
     layer_refs_per_group: list[list[CanonicalKVCacheRef]],
     gpu_to_cpu: bool,
     host_memory_is_pinned: bool = True,
+    prefer_triton: bool = False,
 ):
-    """Resolve the swap_blocks function for a handler at init time."""
+    """Resolve the swap_blocks function for a handler at init time.
+
+    prefer_triton uses the Triton kernel for CPU->GPU copies whatever the page
+    size, where the platform allows it.
+    """
     # GPU->CPU is bandwidth-bound; the dedicated copy engine beats Triton.
     # The Triton kernel dereferences CPU pointers on the GPU, which is only
     # valid for pinned host memory.
@@ -54,10 +59,10 @@ def _select_swap_blocks_fn(
     if not HAS_TRITON or current_platform.is_xpu() or current_platform.is_rocm():
         return ops.swap_blocks_batch
     page_sizes = [r.page_size_bytes for g in layer_refs_per_group for r in g]
-    # Triton wins only on small, 8-byte-aligned payloads.
+    # Triton wins only on small, 8-byte-aligned payloads, by default.
     if (
         not page_sizes
-        or max(page_sizes) >= THRESHOLD_BYTES
+        or (max(page_sizes) >= THRESHOLD_BYTES and not prefer_triton)
         or any(s % 8 for s in page_sizes)
     ):
         return ops.swap_blocks_batch
@@ -299,6 +304,7 @@ class SingleDirectionOffloadingHandler:
         gpu_to_cpu: bool,
         canonical_layout: bool = False,
         host_memory_is_pinned: bool = True,
+        prefer_triton: bool = False,
     ):
         """Initialize a SingleDirectionOffloadingHandler.
 
@@ -315,6 +321,8 @@ class SingleDirectionOffloadingHandler:
                 described by the refs' mappings.
             host_memory_is_pinned: whether the CPU tensors are pinned, so GPU
                 kernels may dereference them directly.
+            prefer_triton: copy CPU->GPU with the Triton kernel whatever the
+                page size, where the platform allows it.
 
         """
         assert len(gpu_tensors) == len(cpu_tensors)
@@ -352,7 +360,7 @@ class SingleDirectionOffloadingHandler:
         self.gpu_to_cpu: bool = gpu_to_cpu
         self.layer_refs_per_group = layer_refs_per_group
         self._swap_blocks_batch = _select_swap_blocks_fn(
-            layer_refs_per_group, gpu_to_cpu, host_memory_is_pinned
+            layer_refs_per_group, gpu_to_cpu, host_memory_is_pinned, prefer_triton
         )
 
         # GPU blocks may be smaller
@@ -807,8 +815,10 @@ class CPUOffloadingWorker(OffloadingWorker):
         num_cpu_chunks: int,
         mmap_region: SharedOffloadRegion | None = None,
         canonical_layout: bool = False,
+        cpu_to_gpu_copy: str = "auto",
     ):
         assert not canonical_layout or mmap_region is not None
+        assert cpu_to_gpu_copy in ("auto", "triton"), cpu_to_gpu_copy
         # The caller owns mmap_region until this constructor returns. After a
         # successful construction, the worker is the sole owner and releases
         # it after both transfer directions have stopped.
@@ -880,6 +890,7 @@ class CPUOffloadingWorker(OffloadingWorker):
             gpu_to_cpu=False,
             canonical_layout=canonical_layout,
             host_memory_is_pinned=host_memory_is_pinned,
+            prefer_triton=cpu_to_gpu_copy == "triton",
         )
 
     def submit_store(
