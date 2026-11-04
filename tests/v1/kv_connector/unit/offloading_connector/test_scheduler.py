@@ -5112,3 +5112,61 @@ def test_failed_promotion_recomputes_the_request(
         script.keys[2]
     }
     assert not runner.connector_scheduler._streaming_loads
+
+
+def _ring_with(runner, num_available: int) -> list[OffloadKey]:
+    """Make the first num_available chunks of the next request hits; each
+    requery_misses() makes one more chunk a hit, as another instance storing
+    them would. Returns the keys made available so far, in chunk order."""
+    available: list[OffloadKey] = []
+    seen: list[OffloadKey] = []
+
+    def lookup(key, req_context):
+        if key not in seen:
+            seen.append(key)
+        if key in available or len(available) < num_available:
+            if key not in available:
+                available.append(key)
+            return LookupResult.HIT
+        return LookupResult.MISS
+
+    def requery_misses(keys, req_context):
+        for key in keys:
+            if key not in available:
+                available.append(key)
+
+    runner.manager.lookup.side_effect = lookup
+    runner.manager.requery_misses.side_effect = requery_misses
+    return available
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_ring_wait_defers_until_the_prompt_is_stored(
+    request_runner, async_scheduling: bool
+):
+    """A ring_wait request waits for the chunks another instance is storing,
+    asking again about the first missing one, then loads them all."""
+    runner = _store_three_chunks(request_runner, async_scheduling)
+    _ring_with(runner, num_available=1)
+
+    runner.new_request(
+        token_ids=[0] * 12 + [1],
+        kv_transfer_params={"ring_wait": {"num_tokens": 13, "timeout_ms": 60000}},
+    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(0, 1, 2))
+    assert runner.manager.requery_misses.call_count >= 2
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_ring_wait_gives_up_at_its_timeout(request_runner, async_scheduling: bool):
+    """Past its timeout, a ring_wait request loads what it found and computes
+    the rest."""
+    runner = _store_three_chunks(request_runner, async_scheduling)
+    _ring_with(runner, num_available=1)
+    runner.manager.requery_misses.side_effect = None
+
+    runner.new_request(
+        token_ids=[0] * 12 + [1],
+        kv_transfer_params={"ring_wait": {"num_tokens": 13, "timeout_ms": 0}},
+    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(0,))

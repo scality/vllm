@@ -431,6 +431,13 @@ class OffloadingManager(ABC):
                 break
         return results
 
+    def requery_misses(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        """Forget that these keys were found missing, so the next lookup asks
+        again: another instance may be storing them."""
+        return
+
     def is_promotion_pending(self, key: OffloadKey) -> bool:
         """Whether a HIT_PENDING key is pending because it is being promoted
         from a lower tier, which reserve_load() can wait for."""

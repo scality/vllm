@@ -761,6 +761,13 @@ class TieringOffloadingManager(OffloadingManager):
         return spec
 
     @override
+    def requery_misses(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        for tier in self.secondary_tiers:
+            tier.requery_misses(keys, req_context)
+
+    @override
     def is_promotion_pending(self, key: OffloadKey) -> bool:
         # Without slices, a request's chunks complete all at once: loading
         # them as they complete would gain nothing.

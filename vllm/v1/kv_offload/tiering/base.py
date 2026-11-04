@@ -293,6 +293,20 @@ class SecondaryTierManager(ABC):
         """
         return
 
+    def requery_misses(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        """Forget that these keys were found missing, so the next lookup asks
+        again: another instance may be storing them. Tiers that cache their
+        verdicts implement it.
+
+        Args:
+            keys: Offload keys to ask about again.
+            req_context: Per-request context.
+
+        """
+        return
+
     def record_access(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> None:

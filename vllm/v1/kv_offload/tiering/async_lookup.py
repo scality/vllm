@@ -213,6 +213,26 @@ class AsyncLookupManager(ABC):
                 state.result = result
                 state.phase = LookupPhase.RESOLVED
 
+    def requery(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
+        """Ask again about keys resolved as missing, in the next batch: another
+        instance may have stored them since. Results of the earlier query are
+        ignored, by generation. Other keys are skipped."""
+        for key in keys:
+            state = self._lookup_state.get(key)
+            if (
+                state is None
+                or state.phase is not LookupPhase.RESOLVED
+                or state.result is not False
+            ):
+                continue
+            state.generation = self._next_generation
+            self._next_generation += 1
+            state.phase = LookupPhase.PENDING
+            state.result = None
+            state.request_ids.add(req_context.req_id)
+            self._req_keys.setdefault(req_context.req_id, set()).add(key)
+            self._lookup_batch.append((key, req_context, state.generation))
+
     def mark_miss(self, keys: Collection[OffloadKey]) -> None:
         """Force the cached verdict for ``keys`` to False after a failed load, so
         the scheduler stops re-issuing the doomed promotion (livelock, #49176).

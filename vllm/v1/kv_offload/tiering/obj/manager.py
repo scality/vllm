@@ -461,6 +461,11 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
             job_metadata.job_id, job_metadata.chunk_ids, obj_keys, NIXL_READ
         )
 
+    def requery_misses(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        self._lookup_manager.requery(keys, req_context)
+
     def on_request_finished(self, req_context: ReqContext) -> None:
         self._lookup_manager.cleanup(req_context.req_id)
 

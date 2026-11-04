@@ -324,3 +324,47 @@ class TestAsyncLookupManager:
         with pytest.raises(AssertionError):
             mgr.drain_results()
         mgr.shutdown()
+
+
+def _resolve(mgr: AsyncLookupManager, key: OffloadKey, ctx: ReqContext):
+    """Flush and wait until the lookup of key resolves."""
+    mgr.flush()
+    for _ in range(1000):
+        mgr.drain_results()
+        result = mgr.lookup(key, ctx)
+        if result is not None:
+            return result
+        threading.Event().wait(0.002)
+    raise AssertionError("lookup never resolved")
+
+
+def test_requery_asks_again_about_a_missing_key():
+    """A key found missing is asked about again after requery(), and the new
+    answer replaces the cached one."""
+    mgr = InMemoryLookupManager()
+    ctx = _ctx()
+    assert mgr.lookup(_key(1), ctx) is None
+    assert _resolve(mgr, _key(1), ctx) is False
+
+    # Stored by someone else since: the cached verdict stays until requery().
+    mgr._existing.add(_key(1))
+    assert mgr.lookup(_key(1), ctx) is False
+    mgr.requery([_key(1)], ctx)
+    assert mgr.lookup(_key(1), ctx) is None
+    assert mgr._lookup_state[_key(1)].phase is LookupPhase.PENDING
+    assert _resolve(mgr, _key(1), ctx) is True
+    mgr.shutdown()
+
+
+def test_requery_skips_found_and_unknown_keys():
+    mgr = InMemoryLookupManager(existing_keys={_key(1)})
+    ctx = _ctx()
+    mgr.lookup(_key(1), ctx)
+    assert _resolve(mgr, _key(1), ctx) is True
+    generation = mgr._lookup_state[_key(1)].generation
+
+    mgr.requery([_key(1), _key(2)], ctx)
+    assert mgr._lookup_state[_key(1)].generation == generation
+    assert mgr.lookup(_key(1), ctx) is True
+    assert _key(2) not in mgr._lookup_state
+    mgr.shutdown()
