@@ -30,6 +30,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingCounterMetadata,
     OffloadingEvent,
     OffloadingGaugeMetadata,
+    OffloadingManager,
     OffloadKey,
     OffloadPolicy,
     ReqContext,
@@ -1623,3 +1624,85 @@ def test_parse_tier_filter_skips_bad_entries():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class _RetryingTier(ExampleSecondaryTierManager):
+    """An example tier that answers RETRY for some keys."""
+
+    def __init__(self, *args, retry: set[OffloadKey], **kwargs):
+        super().__init__(*args, **kwargs)
+        self.retry = retry
+
+    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        if key in self.retry:
+            return LookupResult.RETRY
+        return super().lookup(key, req_context)
+
+
+def _lookup_setup(num_chunks, primary_ids, tier_ids, retry_ids=None):
+    region = _mock_mmap_region(num_chunks)
+    primary = CPUPrimaryTierOffloadingManager(num_chunks=num_chunks, mmap_region=region)
+    tiers = []
+    for i, ids in enumerate(tier_ids):
+        tier = _RetryingTier(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=region.create_kv_memoryview(),
+            tier_type="example",
+            retry=set(to_keys((retry_ids or {}).get(i, ()))),
+        )
+        for key in to_keys(ids):
+            tier.chunks[key] = True
+        tiers.append(tier)
+    manager = TieringOffloadingManager(primary_tier=primary, secondary_tiers=tiers)
+    if primary_ids:
+        primary.prepare_store(to_keys(primary_ids), _CTX)
+        primary.complete_store(to_keys(primary_ids), _CTX)
+    manager.on_new_request(_CTX)
+    return manager
+
+
+def _lookup_state(manager, keys):
+    policy = manager.primary_tier._policy
+    stats = manager._metrics._stats.data["data"]
+    return {
+        "primary": {
+            k: (c is not None and c.is_ready) if (c := policy.get(k)) else None
+            for k in keys
+        },
+        "pending": {
+            tier: {req: list(entry.keys) for req, entry in by_req.items()}
+            for tier, by_req in manager._pending_load_submissions.items()
+        },
+        "queries": stats.get(TieringOffloadingMetrics.CHUNK_QUERIES),
+        "hits": stats.get(TieringOffloadingMetrics.CHUNK_HITS),
+    }
+
+
+@pytest.mark.parametrize(
+    "num_chunks, primary_ids, tier_ids, retry_ids, lookup_ids",
+    [
+        # CPU-tier hits, then secondary hits, then a miss that stops the scan.
+        (16, [0, 1], [[2, 3, 4, 6]], None, range(8)),
+        # A retry does not stop the scan.
+        (16, [], [[2, 4]], {0: [3]}, range(2, 6)),
+        # The CPU tier fills up in the middle of a run of promotions.
+        (4, [], [range(8)], None, range(8)),
+        # Keys found in two secondary tiers, in turn.
+        (16, [], [[0, 1, 4], [2, 3]], None, range(6)),
+        # A CPU-tier hit after a run of promotions, evicted by them.
+        (3, [2, 9], [[0, 1, 3]], None, range(4)),
+        # A CPU-tier hit after a run of promotions, still there.
+        (8, [2], [[0, 1, 3]], None, range(5)),
+    ],
+    ids=["mixed", "retry", "full", "two-tiers", "evicted-hit", "kept-hit"],
+)
+def test_lookup_prefix_matches_lookup_one_key_at_a_time(
+    num_chunks, primary_ids, tier_ids, retry_ids, lookup_ids
+):
+    keys = to_keys(lookup_ids)
+    one_by_one = _lookup_setup(num_chunks, primary_ids, tier_ids, retry_ids)
+    expected = OffloadingManager.lookup_prefix(one_by_one, keys, _CTX)
+
+    batched = _lookup_setup(num_chunks, primary_ids, tier_ids, retry_ids)
+    assert batched.lookup_prefix(keys, _CTX) == expected
+    assert _lookup_state(batched, keys) == _lookup_state(one_by_one, keys)

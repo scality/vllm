@@ -500,6 +500,141 @@ class TieringOffloadingManager(OffloadingManager):
         return LookupResult.MISS
 
     @override
+    def lookup_prefix(
+        self, keys: Sequence[OffloadKey], req_context: ReqContext
+    ) -> list[LookupResult]:
+        """lookup() each key in order, stopping after the first MISS.
+
+        Gives the same results as calling lookup() for each key, with fewer
+        Python calls: the tier filter is evaluated once, the metrics are
+        recorded once per tier, and a run of consecutive keys found in the same
+        secondary tier is allocated in the primary tier with one prepare_write().
+
+        A promotion allocated later can evict a chunk an earlier lookup found
+        in the primary tier, so the pending run is allocated before a key found
+        in the primary tier is reported, and that key is looked up again.
+
+        One difference: when the primary tier cannot take a run, the keys of
+        the run after the first that does not fit have already been looked up
+        in the secondary tier. They are left out of the results and metrics.
+        """
+        self._maybe_process_finished_jobs()
+        start_time = time.monotonic()
+        primary_lookup = self.primary_tier.lookup
+        tiers = [
+            (i, tier)
+            for i, tier in enumerate(self.secondary_tiers)
+            if req_context.load_tier_filter.allows(tier.medium, tier.locality)
+        ]
+        # (position in results, key, result) of each lookup.
+        primary_lookups: list[tuple[int, OffloadKey, LookupResult]] = []
+        tier_lookups: dict[int, list[tuple[int, OffloadKey, LookupResult]]] = {
+            i: [] for i, _ in tiers
+        }
+        results: list[LookupResult] = []
+        # Keys found in tier run_tier, whose promotion is not allocated yet,
+        # and their positions in results.
+        run_tier = -1
+        run_keys: list[OffloadKey] = []
+        run_positions: list[int] = []
+
+        def flush_run() -> bool:
+            """Allocate the pending run. False if a key of it could not be
+            allocated: results then end with that key's MISS."""
+            nonlocal run_tier
+            if not run_keys:
+                return True
+            num_promoted = self._initiate_promotions(run_tier, run_keys, req_context)
+            failed = num_promoted < len(run_keys)
+            if failed:
+                position = run_positions[num_promoted]
+                results[position] = LookupResult.MISS
+                del results[position + 1 :]
+            run_keys.clear()
+            run_positions.clear()
+            run_tier = -1
+            return not failed
+
+        stopped = False
+        for key in keys:
+            primary_hit = primary_lookup(key, req_context)
+            if primary_hit is not LookupResult.MISS and run_keys:
+                if not flush_run():
+                    stopped = True
+                    break
+                primary_hit = primary_lookup(key, req_context)
+            primary_lookups.append((len(results), key, primary_hit))
+            if primary_hit is not LookupResult.MISS:
+                results.append(primary_hit)
+                continue
+
+            result = LookupResult.MISS
+            any_retry = False
+            for i, tier in tiers:
+                tier_result = tier.lookup(key, req_context)
+                tier_lookups[i].append((len(results), key, tier_result))
+                if tier_result is LookupResult.HIT:
+                    if run_keys and run_tier != i and not flush_run():
+                        stopped = True
+                    else:
+                        run_tier = i
+                        run_keys.append(key)
+                        run_positions.append(len(results))
+                        result = LookupResult.HIT_PENDING
+                    break
+                if tier_result is LookupResult.RETRY:
+                    any_retry = True
+            if stopped:
+                break
+            if result is LookupResult.MISS and any_retry:
+                result = LookupResult.RETRY
+            results.append(result)
+            if result is LookupResult.MISS:
+                break
+        if not stopped:
+            flush_run()
+
+        num_lookups = len(primary_lookups) + sum(map(len, tier_lookups.values()))
+        lookup_duration = (time.monotonic() - start_time) / max(num_lookups, 1)
+        end = len(results)
+        self._metrics.on_lookups(
+            req_context,
+            self._metrics.primary_tier_label,
+            [(key, result) for pos, key, result in primary_lookups if pos < end],
+            lookup_duration,
+        )
+        for i, lookups in tier_lookups.items():
+            self._metrics.on_lookups(
+                req_context,
+                self._metrics.tier_label(i),
+                [(key, result) for pos, key, result in lookups if pos < end],
+                lookup_duration,
+            )
+        return results
+
+    def _initiate_promotions(
+        self,
+        tier_idx: int,
+        keys: list[OffloadKey],
+        req_context: ReqContext,
+    ) -> int:
+        """_initiate_promotion() for keys found in the same tier, with one
+        allocation if the primary tier has room for all of them.
+
+        Returns how many keys, from the first, were promoted: if the primary
+        tier cannot take them all, they are promoted one by one and the first
+        that fails stops the run, as with lookup() one key at a time.
+        """
+        primary_write_result = self.primary_tier.prepare_write(keys, req_context)
+        if primary_write_result is None:
+            for n, key in enumerate(keys):
+                if not self._initiate_promotion(tier_idx, key, req_context):
+                    return n
+            return len(keys)
+        self._register_promotion(tier_idx, primary_write_result, req_context)
+        return len(keys)
+
+    @override
     def get_load_source(
         self, key: OffloadKey, req_context: ReqContext
     ) -> CacheHitSource:
@@ -543,6 +678,17 @@ class TieringOffloadingManager(OffloadingManager):
             self._metrics.on_promotion_allocation_failure()
             return False
 
+        self._register_promotion(tier_idx, primary_write_result, req_context)
+        return True
+
+    def _register_promotion(
+        self,
+        tier_idx: int,
+        primary_write_result: PrepareStoreOutput,
+        req_context: ReqContext,
+    ) -> None:
+        """Queue the chunks allocated for a promotion, to be submitted to the
+        tier at the end of the step."""
         store_spec = primary_write_result.store_spec
         assert isinstance(store_spec, CPULoadStoreSpec)
         load_sources = self._request_load_sources.setdefault(req_context.req_id, {})
@@ -561,7 +707,6 @@ class TieringOffloadingManager(OffloadingManager):
         entry = tier_pending[ctx_id]
         entry.keys.extend(primary_write_result.keys_to_store)
         entry.chunk_ids.extend(store_spec.chunk_ids)
-        return True
 
     def _flush_pending_promotions(self) -> None:
         """Submit one batched submit_load() per (tier, request).

@@ -131,6 +131,12 @@ class MockOffloadingSpec(OffloadingSpec):
         super().__init__(config)
 
         self.manager = MagicMock(spec=OffloadingManager)
+        # Look keys up one by one, so tests can script lookup() alone.
+        self.manager.lookup_prefix.side_effect = (
+            lambda keys, req_context: OffloadingManager.lookup_prefix(
+                self.manager, keys, req_context
+            )
+        )
         self.manager.prepare_load = lambda keys, req_context: MockLoadStoreSpec(keys)
         self.manager.lookup.return_value = LookupResult.MISS
         self.manager.get_load_source.return_value = CacheHitSource.EXTERNAL_UNSPECIFIED

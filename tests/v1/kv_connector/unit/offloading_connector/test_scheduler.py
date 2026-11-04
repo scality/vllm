@@ -1883,6 +1883,11 @@ def _make_scheduler_with_lookup(
         return lookup_results.get(int(block_hash.decode()), default)
 
     manager.lookup.side_effect = lookup
+    manager.lookup_prefix.side_effect = (
+        lambda keys, req_context: OffloadingManager.lookup_prefix(
+            manager, keys, req_context
+        )
+    )
     manager.is_promotion_pending.return_value = False
 
     scheduler = object.__new__(OffloadingConnectorScheduler)

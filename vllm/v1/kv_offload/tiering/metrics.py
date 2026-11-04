@@ -3,6 +3,7 @@
 
 import functools
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -111,6 +112,57 @@ class TieringMetricsTracker:
         elif result is LookupResult.RETRY and state.observed_lookups is not None:
             observed = state.observed_lookups.setdefault(tier_label, {})
             observed.setdefault(key, time.monotonic() - lookup_duration)
+
+    def on_lookups(
+        self,
+        req_context: ReqContext,
+        tier_label: TierLabel,
+        lookups: Sequence[tuple[OffloadKey, LookupResult]],
+        lookup_duration: float,
+    ) -> None:
+        """on_lookup() for several keys looked up in one tier, each taking
+        lookup_duration, with one update per metric."""
+        state = self._request_states.get(req_context.req_id)
+        if state is None:
+            state = _RequestMetricsState()
+            self._request_states[req_context.req_id] = state
+        if state.observed_lookups is None or not lookups:
+            return
+
+        observed = state.observed_lookups.setdefault(tier_label, {})
+        now = time.monotonic()
+        queries = 0
+        hits = 0
+        async_delays: list[float] = []
+        for key, result in lookups:
+            if result is LookupResult.HIT or result is LookupResult.MISS:
+                start_time = observed.get(key)
+                if key not in observed or start_time is not None:
+                    observed[key] = None
+                    queries += 1
+                    hits += result is LookupResult.HIT
+                    if start_time is not None:
+                        async_delays.append(now - start_time)
+            elif result is LookupResult.RETRY:
+                observed.setdefault(key, now - lookup_duration)
+
+        if queries:
+            self._stats.increase_counter(
+                TieringOffloadingMetrics.CHUNK_QUERIES, queries, tier_label
+            )
+            self._stats.observe_histogram_values(
+                TieringOffloadingMetrics.LOOKUP_SYNC_DELAY,
+                [lookup_duration] * queries,
+                tier_label,
+            )
+        if hits:
+            self._stats.increase_counter(
+                TieringOffloadingMetrics.CHUNK_HITS, hits, tier_label
+            )
+        if async_delays:
+            self._stats.observe_histogram_values(
+                TieringOffloadingMetrics.LOOKUP_ASYNC_DELAY, async_delays, tier_label
+            )
 
     def on_job_registered(self, job_metadata: _JobMetadataLike) -> None:
         transfer_job = job_metadata.transfer_job

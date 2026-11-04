@@ -415,6 +415,22 @@ class OffloadingManager(ABC):
         """
         return ()
 
+    def lookup_prefix(
+        self, keys: Sequence[OffloadKey], req_context: ReqContext
+    ) -> list[LookupResult]:
+        """lookup() each key in order, stopping after the first MISS.
+
+        Returns the results up to and including that MISS. A manager may
+        override this to look keys up for less than one lookup() call each.
+        """
+        results = []
+        for key in keys:
+            result = self.lookup(key, req_context)
+            results.append(result)
+            if result is LookupResult.MISS:
+                break
+        return results
+
     def is_promotion_pending(self, key: OffloadKey) -> bool:
         """Whether a HIT_PENDING key is pending because it is being promoted
         from a lower tier, which reserve_load() can wait for."""

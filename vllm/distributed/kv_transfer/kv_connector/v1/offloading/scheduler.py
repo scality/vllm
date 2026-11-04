@@ -726,8 +726,9 @@ class OffloadingConnectorScheduler:
         or None if the backend deferred a lookup."""
         hit_count = 0
         defer_lookup = False
-        for local_idx, key in enumerate(keys):
-            result = self.manager.lookup(key, req_context)
+        keys = list(keys)
+        results = self.manager.lookup_prefix(keys, req_context)
+        for local_idx, (key, result) in enumerate(zip(keys, results)):
             match result:
                 case LookupResult.HIT:
                     self._events_tracker.record_lookup(
