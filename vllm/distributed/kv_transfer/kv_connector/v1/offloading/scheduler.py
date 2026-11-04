@@ -73,6 +73,9 @@ _RESET_FENCE_WARN_S = 60
 KV_LOAD_TIERS_KEY = "kv_load_tiers"
 MATCHER_MEDIUM_KEY = "medium"
 MATCHER_LOCALITY_KEY = "locality"
+# How often a ring_wait request asks the RING again about its first missing
+# chunk.
+_RING_WAIT_REQUERY_INTERVAL = 0.005
 
 
 @dataclass(slots=True)
@@ -388,6 +391,12 @@ class RequestOffloadState:
     transfer_jobs: set[int] = field(default_factory=set)
     # Set while a load waits for some of its chunks to be promoted.
     streaming_load: StreamingLoad | None = None
+    # ring_wait: tokens of the prompt another instance is storing, which this
+    # request waits for until ring_wait_deadline (time.monotonic()).
+    ring_wait_tokens: int | None = None
+    ring_wait_timeout: float = 0.0
+    ring_wait_deadline: float | None = None
+    ring_wait_next_requery: float = 0.0
     # time.monotonic() of this request's first deferred offload lookup;
     # None once consumed (observed) or while no lookup is pending.
     deferred_lookup_start_time: float | None = None
@@ -424,6 +433,26 @@ class RequestOffloadState:
             logger.warning(
                 "max_load_tokens must be a non-negative int, got %r; ignoring", raw
             )
+
+        # NOTE: This field is experimental and subject to change in the future.
+        raw = params.get("ring_wait") if params else None
+        if raw is not None:
+            num_tokens = raw.get("num_tokens") if isinstance(raw, dict) else None
+            timeout_ms = raw.get("timeout_ms", 5000) if isinstance(raw, dict) else None
+            if (
+                type(num_tokens) is int
+                and num_tokens > 0
+                and type(timeout_ms) is int
+                and timeout_ms >= 0
+            ):
+                self.ring_wait_tokens = num_tokens
+                self.ring_wait_timeout = timeout_ms / 1000
+            else:
+                logger.warning(
+                    "ring_wait must be {'num_tokens': int > 0, 'timeout_ms': "
+                    "int >= 0}, got %r; ignoring",
+                    raw,
+                )
 
         # NOTE: This field is experimental and subject to change in the future.
         raw = params.get("max_offload_tokens") if params else None
@@ -1478,6 +1507,10 @@ class OffloadingConnectorScheduler:
                 _ConnectorMetricName.LOOKUP_SYNC_DELAY,
                 time.monotonic() - lookup_start,
             )
+            if num_hit_tokens is not None and self._ring_wait_pending(
+                req_status, num_computed_tokens, num_hit_tokens
+            ):
+                num_hit_tokens = None
             if num_hit_tokens is None:
                 if req_status.deferred_lookup_start_time is None:
                     req_status.deferred_lookup_start_time = lookup_start
@@ -1534,6 +1567,63 @@ class OffloadingConnectorScheduler:
             )
         ]
         return any(self.manager.is_promotion_pending(key) for key in keys)
+
+    def _ring_wait_pending(
+        self,
+        req_status: RequestOffloadState,
+        num_computed_tokens: int,
+        num_hit_tokens: int,
+    ) -> bool:
+        """Whether a ring_wait request must keep waiting for chunks another
+        instance is storing.
+
+        It waits until its hits cover the prompt that instance computed, in
+        whole chunks and without its last token, which is always computed here.
+        Meanwhile the first missing chunk is asked about again every
+        _RING_WAIT_REQUERY_INTERVAL. Past the deadline, the request goes on
+        with the hits it has and computes the rest.
+        """
+        if req_status.ring_wait_tokens is None:
+            return False
+        now = time.monotonic()
+        if req_status.ring_wait_deadline is None:
+            req_status.ring_wait_deadline = now + req_status.ring_wait_timeout
+
+        have = num_computed_tokens + num_hit_tokens
+        tokens_per_chunk = max(
+            self.config.kv_group_configs[i].tokens_per_chunk
+            for i in self._full_attention_groups
+        )
+        target = round_down(
+            min(req_status.ring_wait_tokens, req_status.req.num_tokens) - 1,
+            tokens_per_chunk,
+        )
+        if have >= target:
+            req_status.ring_wait_tokens = None
+            return False
+        if now >= req_status.ring_wait_deadline:
+            logger.warning(
+                "Request %s: waited %.0f ms for the RING to hold %d tokens, found "
+                "%d; computing the rest",
+                req_status.req.request_id,
+                req_status.ring_wait_timeout * 1000,
+                target,
+                have,
+            )
+            req_status.ring_wait_tokens = None
+            return False
+
+        if now >= req_status.ring_wait_next_requery:
+            keys = []
+            for group_idx in self._full_attention_groups:
+                group_config = self.config.kv_group_configs[group_idx]
+                offload_keys = req_status.group_states[group_idx].offload_keys
+                chunk_idx = have // group_config.tokens_per_chunk
+                if chunk_idx < len(offload_keys):
+                    keys.append(offload_keys[chunk_idx])
+            self.manager.requery_misses(keys, req_status.req_context)
+            req_status.ring_wait_next_requery = now + _RING_WAIT_REQUERY_INTERVAL
+        return True
 
     def get_external_cache_hit_sources(
         self,
