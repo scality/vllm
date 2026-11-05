@@ -514,6 +514,12 @@ class TieringOffloadingManager(OffloadingManager):
         in the primary tier, so the pending run is allocated before a key found
         in the primary tier is reported, and that key is looked up again.
 
+        A run never evicts the chunks reported as found in the primary tier
+        before it: the caller loads them right after this lookup without
+        looking them up again, and a run that only fits by evicting them stops
+        where it does not fit. lookup() one key at a time cannot know them, so
+        there it may evict them.
+
         One difference: when the primary tier cannot take a run, the keys of
         the run after the first that does not fit have already been looked up
         in the secondary tier. They are left out of the results and metrics.
@@ -532,6 +538,8 @@ class TieringOffloadingManager(OffloadingManager):
             i: [] for i, _ in tiers
         }
         results: list[LookupResult] = []
+        # Keys found ready in the primary tier, which runs must not evict.
+        hit_keys: list[OffloadKey] = []
         # Keys found in tier run_tier, whose promotion is not allocated yet,
         # and their positions in results.
         run_tier = -1
@@ -544,7 +552,9 @@ class TieringOffloadingManager(OffloadingManager):
             nonlocal run_tier
             if not run_keys:
                 return True
-            num_promoted = self._initiate_promotions(run_tier, run_keys, req_context)
+            num_promoted = self._initiate_promotions(
+                run_tier, run_keys, req_context, hit_keys
+            )
             failed = num_promoted < len(run_keys)
             if failed:
                 position = run_positions[num_promoted]
@@ -565,6 +575,8 @@ class TieringOffloadingManager(OffloadingManager):
                 primary_hit = primary_lookup(key, req_context)
             primary_lookups.append((len(results), key, primary_hit))
             if primary_hit is not LookupResult.MISS:
+                if primary_hit is LookupResult.HIT:
+                    hit_keys.append(key)
                 results.append(primary_hit)
                 continue
 
@@ -617,18 +629,24 @@ class TieringOffloadingManager(OffloadingManager):
         tier_idx: int,
         keys: list[OffloadKey],
         req_context: ReqContext,
+        protected_keys: Collection[OffloadKey] = (),
     ) -> int:
         """_initiate_promotion() for keys found in the same tier, with one
-        allocation if the primary tier has room for all of them.
+        allocation if the primary tier has room for all of them, without
+        evicting protected_keys.
 
         Returns how many keys, from the first, were promoted: if the primary
         tier cannot take them all, they are promoted one by one and the first
         that fails stops the run, as with lookup() one key at a time.
         """
-        primary_write_result = self.primary_tier.prepare_write(keys, req_context)
+        primary_write_result = self.primary_tier.prepare_write(
+            keys, req_context, protected_keys
+        )
         if primary_write_result is None:
             for n, key in enumerate(keys):
-                if not self._initiate_promotion(tier_idx, key, req_context):
+                if not self._initiate_promotion(
+                    tier_idx, key, req_context, protected_keys
+                ):
                     return n
             return len(keys)
         self._register_promotion(tier_idx, primary_write_result, req_context)
@@ -648,6 +666,7 @@ class TieringOffloadingManager(OffloadingManager):
         tier_idx: int,
         key: OffloadKey,
         req_context: ReqContext,
+        protected_keys: Collection[OffloadKey] = (),
     ) -> bool:
         """Queue a chunk for promotion from a secondary tier to the primary tier.
 
@@ -661,6 +680,7 @@ class TieringOffloadingManager(OffloadingManager):
             tier_idx: The secondary tier index to promote from
             key: Chunk to promote
             req_context: Per-request context forwarded to primary.prepare_write().
+            protected_keys: Chunks the allocation must not evict.
 
         Returns:
             True if promotion was initiated, False if primary tier is full.
@@ -670,7 +690,9 @@ class TieringOffloadingManager(OffloadingManager):
         # Must happen immediately so primary.lookup() returns None (in-flight)
         # for this key on any subsequent lookup() call within the same step,
         # preventing duplicate promotion attempts.
-        primary_write_result = self.primary_tier.prepare_write([key], req_context)
+        primary_write_result = self.primary_tier.prepare_write(
+            [key], req_context, protected_keys
+        )
 
         if primary_write_result is None:
             # Primary tier is full; caller should treat the chunk as unavailable

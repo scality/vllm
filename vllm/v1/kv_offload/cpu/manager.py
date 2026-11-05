@@ -309,7 +309,11 @@ class CPUOffloadingManager(OffloadingManager):
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
+        protected_keys: Collection[OffloadKey] = (),
     ) -> PrepareStoreOutput | None:
+        """Allocate chunks for keys not stored yet, evicting idle chunks if
+        needed. protected_keys are never evicted, as keys themselves: chunks
+        the caller relies on without holding a reference to them."""
         keys = list(keys)
         if self.counts is not None:
             self._record_accesses(keys)
@@ -378,6 +382,7 @@ class CPUOffloadingManager(OffloadingManager):
             # Chunks from the original input are excluded from eviction candidates:
             # a chunk that was already stored must remain in the cache after this call.
             protected = set(keys)
+            protected.update(protected_keys)
             evicted = self._policy.evict(num_chunks_to_evict, protected)
             if evicted is None:
                 return None

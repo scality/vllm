@@ -1706,3 +1706,31 @@ def test_lookup_prefix_matches_lookup_one_key_at_a_time(
     batched = _lookup_setup(num_chunks, primary_ids, tier_ids, retry_ids)
     assert batched.lookup_prefix(keys, _CTX) == expected
     assert _lookup_state(batched, keys) == _lookup_state(one_by_one, keys)
+
+
+@pytest.mark.parametrize(
+    "num_chunks, expected",
+    [
+        # The run takes the slot of the idle chunk 9, not of the hit 0.
+        (3, [LookupResult.HIT, LookupResult.HIT_PENDING, LookupResult.HIT_PENDING]),
+        # No other chunk to evict: the run stops where the CPU tier is full.
+        (2, [LookupResult.HIT, LookupResult.HIT_PENDING, LookupResult.MISS]),
+    ],
+    ids=["evicts-another-chunk", "run-cut-short"],
+)
+def test_lookup_prefix_keeps_the_hits_found_before_a_run(num_chunks, expected):
+    # Chunk 0 is in the CPU tier, older than chunk 9; chunks 1 and 2 are only
+    # in the secondary tier. The request is scheduled right after its lookup
+    # and reserves the chunks it was told about.
+    manager = _lookup_setup(num_chunks, [0, 9][:num_chunks], [[1, 2]])
+    keys = to_keys(range(3))
+
+    results = manager.lookup_prefix(keys, _CTX)
+
+    assert results == expected
+    found = (
+        keys[: results.index(LookupResult.MISS)]
+        if LookupResult.MISS in results
+        else keys
+    )
+    manager.reserve_load(found, _CTX)
