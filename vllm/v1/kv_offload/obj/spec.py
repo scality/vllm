@@ -13,6 +13,12 @@ reads what the other wrote. kv_connector_extra_config:
     max_inflight_store_chunks: chunks being stored above which new stores
         wait (default 4096)
     reuse_notify: see ReuseNotifier.from_config
+    piece_chunks: most chunks a piece moves through the staging buffer
+        (default a quarter of its slots)
+    max_inflight_gets: most chunks a worker reads from the store at once
+        (default all its staging slots)
+    cpu_to_gpu_copy: "triton" copies loaded chunks into the KV cache with
+        the Triton kernel whatever the page size (default "auto")
 
 Set kv_load_failure_policy to "recompute": a load fails when the store has
 evicted the chunk since it was looked up. With more than one worker, chunks
@@ -74,6 +80,14 @@ class ObjOffloadingSpec(OffloadingSpec):
             self.extra_config.get("max_inflight_store_chunks", 4096)
         )
         self.replicated_layout = config.replicated_layout
+        self.piece_chunks = self.extra_config.get("piece_chunks")
+        self.max_inflight_gets = self.extra_config.get("max_inflight_gets")
+        self.cpu_to_gpu_copy: str = self.extra_config.get("cpu_to_gpu_copy", "auto")
+        if self.cpu_to_gpu_copy not in ("auto", "triton"):
+            raise ValueError(
+                "cpu_to_gpu_copy must be 'auto' or 'triton', got "
+                f"{self.cpu_to_gpu_copy!r}"
+            )
 
         # One object is one CPU tier chunk row (see CPUOffloadingSpec).
         num_copies = 1 if self.replicated_layout else world_size
@@ -138,5 +152,9 @@ class ObjOffloadingSpec(OffloadingSpec):
                 world_size=world_size,
                 all_gather=_tp_all_gather if world_size > 1 else None,
                 replicated=self.replicated_layout,
+                piece_chunks=self.piece_chunks and int(self.piece_chunks),
+                max_inflight_gets=self.max_inflight_gets
+                and int(self.max_inflight_gets),
+                prefer_triton=self.cpu_to_gpu_copy == "triton",
             )
         return self._worker
