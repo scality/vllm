@@ -232,6 +232,7 @@ def test_swa_offload_window_covers_unaligned_hit(
         blocks_per_chunk=4,
         offload_prompt_only=True,
         extra_config={},
+        min_load_tokens=0,
         kv_events_config=OffloadingKVEventsConfig(
             enable_kv_cache_events=False, self_describing_kv_events=False
         ),
@@ -7259,3 +7260,30 @@ def test_failed_load_marks_its_chunks_failed(request_runner, async_scheduling: b
 
     runner.manager.mark_load_failed.assert_called_once()
     assert len(runner.manager.mark_load_failed.call_args.args[0]) == 3
+
+
+@pytest.mark.parametrize("min_load_tokens,expected_loaded", [(16, ()), (8, (0, 1, 2))])
+def test_short_hits_are_computed_not_loaded(
+    request_runner, min_load_tokens: int, expected_loaded: tuple[int, ...]
+):
+    """A hit beyond the GPU prefix cache shorter than min_load_tokens is
+    computed: a load would cost more than computing those few tokens."""
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=100,
+        async_scheduling=True,
+        extra_config_overrides={"min_load_tokens": min_load_tokens},
+    )
+    runner.new_request(token_ids=[0] * 12)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0, 1, 2))
+    runner.scheduler.reset_prefix_cache()
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    runner.manager.lookup.return_value = LookupResult.HIT
+
+    runner.new_request(token_ids=[0] * 12 + [1])
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=expected_loaded)

@@ -880,6 +880,12 @@ class OffloadingSpec(ABC):
             self.extra_config.get("offload_prompt_only", True)
         )
 
+        # A hit beyond the GPU prefix cache shorter than this is computed
+        # instead of loaded: a load costs a transfer and scheduler steps. With
+        # speculative decoding (EAGLE/MTP) the GPU prefix cache leaves out its
+        # last matched block, which this keeps from being loaded back.
+        self.min_load_tokens: int = int(self.extra_config.get("min_load_tokens", 0))
+
         self.tokens_per_block = tuple(group.tokens_per_block for group in config.groups)
         self.tokens_per_hash = config.cache.tokens_per_hash
         self.blocks_per_chunk = config.cache.blocks_per_chunk
