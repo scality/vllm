@@ -15,9 +15,11 @@ reads what the other wrote. kv_connector_extra_config:
     reuse_notify: see ReuseNotifier.from_config
 
 Set kv_load_failure_policy to "recompute": a load fails when the store has
-evicted the chunk since it was looked up. With more than one worker, the KV
-must be replicated (MLA with canonical_layout); each chunk then has one owner
-worker that moves it for all.
+evicted the chunk since it was looked up. With more than one worker, chunks
+must not depend on the parallel configuration (see canonical_layout); each
+chunk then has one owner worker, which moves it for all: it gathers a chunk
+sharded across the workers through CUDA IPC, or stores its own copy of a
+replicated one.
 """
 
 from typing import Any
@@ -53,11 +55,13 @@ class ObjOffloadingSpec(OffloadingSpec):
     def __init__(self, config: OffloadingConfig):
         super().__init__(config)
         world_size = config.parallel.world_size
-        if world_size != 1 and not config.replicated_layout:
+        if world_size != 1 and not (
+            config.replicated_layout or config.parallel.is_parallelism_agnostic
+        ):
             raise NotImplementedError(
-                "ObjOffloadingSpec supports several workers only with the "
-                f"replicated layout (world_size={world_size}); set "
-                "canonical_layout for an MLA model"
+                "ObjOffloadingSpec needs KV whose chunks do not depend on the "
+                f"parallel configuration with several workers (world_size="
+                f"{world_size}); set canonical_layout"
             )
         store_config: dict[str, Any] | None = self.extra_config.get("store_config")
         if not store_config:
@@ -122,9 +126,9 @@ class ObjOffloadingSpec(OffloadingSpec):
                 kv_caches=kv_caches,
                 blocks_per_chunk=self.blocks_per_chunk,
                 chunk_bytes=self.chunk_bytes,
-                page_offset=0
-                if self.replicated_layout
-                else rank * self.page_size_per_worker,
+                rank_page_bytes=0
+                if self.replicated_layout or canonical_layout
+                else self.page_size_per_worker,
                 canonical_layout=canonical_layout,
                 store_config=self.store_config,
                 io_threads=self.io_threads,
@@ -133,5 +137,6 @@ class ObjOffloadingSpec(OffloadingSpec):
                 rank=rank,
                 world_size=world_size,
                 all_gather=_tp_all_gather if world_size > 1 else None,
+                replicated=self.replicated_layout,
             )
         return self._worker

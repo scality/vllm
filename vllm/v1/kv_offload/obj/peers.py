@@ -104,31 +104,37 @@ def share_tensors(
 
 
 class CrossRankFence:
-    """Lets a worker wait, on its own stream, until another worker's KV cache
-    is ready for a load job.
+    """Orders the workers' accesses to each other's KV caches for a job.
 
     Each worker records an interprocess event on its compute stream when it
-    receives a load job, then publishes the job id in shared memory. A waiter
-    seeing a published id at least the job's waits on that event: a later
-    record covers the earlier work too, as job ids increase.
+    receives a job, then publishes the job id in shared memory: a worker
+    seeing a published id at least the job's waits on that event before
+    touching that worker's KV cache (a later record covers the earlier work
+    too, as job ids increase).
+
+    Each worker also publishes the id up to which every store it owns has
+    copied its chunks out of the KV caches: another worker reuses blocks of a
+    store only past it.
     """
 
     def __init__(self, rank: int, world_size: int, all_gather: AllGather):
         self._rank = rank
+        self._world_size = world_size
         self._event = torch.cuda.Event(interprocess=True)
         name = all_gather(
             f"vllm_obj_fence_{secrets.token_hex(8)}" if rank == 0 else None
         )[0]
         if rank == 0:
             self._shm = shared_memory.SharedMemory(
-                name=name, create=True, size=8 * world_size
+                name=name, create=True, size=16 * world_size
             )
         all_gather(None)
         if rank != 0:
             self._shm = shared_memory.SharedMemory(name=name)
-        self._ready = np.ndarray((world_size,), dtype=np.int64, buffer=self._shm.buf)
+        state = np.ndarray((2, world_size), dtype=np.int64, buffer=self._shm.buf)
+        self._received, self._copied = state[0], state[1]
         if rank == 0:
-            self._ready[:] = -1
+            state[:] = -1
         all_gather(None)
         device = torch.accelerator.current_device_index()
         handles = all_gather(self._event.ipc_handle())
@@ -143,7 +149,7 @@ class CrossRankFence:
         """This worker's KV cache is ready for job_id once its current stream
         has reached this point."""
         self._event.record()
-        self._ready[self._rank] = job_id
+        self._received[self._rank] = max(self._received[self._rank], job_id)
 
     def wait(self, job_id: int, stream: torch.cuda.Stream, timeout_s: float) -> None:
         """Make stream wait until every worker's KV cache is ready for job_id.
@@ -154,16 +160,34 @@ class CrossRankFence:
         """
         deadline = time.monotonic() + timeout_s
         for peer, event in enumerate(self._events):
-            while self._ready[peer] < job_id:
-                if time.monotonic() > deadline:
-                    raise TimeoutError(
-                        f"worker {peer} did not publish load job {job_id}"
-                    )
-                time.sleep(1e-5)
+            _wait_until(self._received, peer, job_id, deadline)
             stream.wait_event(event)
 
+    def publish_copied(self, job_id: int) -> None:
+        """Every store this worker owns up to job_id has read the KV caches."""
+        self._copied[self._rank] = max(self._copied[self._rank], job_id)
+
+    def wait_copied(self, job_id: int, timeout_s: float) -> None:
+        """Wait until every worker's stores up to job_id have read the KV
+        caches.
+
+        Raises:
+            TimeoutError: a worker did not get there in time.
+
+        """
+        deadline = time.monotonic() + timeout_s
+        for peer in range(self._world_size):
+            _wait_until(self._copied, peer, job_id, deadline)
+
     def close(self) -> None:
-        del self._ready
+        del self._received, self._copied
         self._shm.close()
         if self._rank == 0:
             self._shm.unlink()
+
+
+def _wait_until(published: np.ndarray, peer: int, job_id: int, deadline: float) -> None:
+    while published[peer] < job_id:
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"worker {peer} did not get to the job in time")
+        time.sleep(1e-5)

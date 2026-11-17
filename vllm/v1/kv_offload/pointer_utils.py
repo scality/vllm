@@ -151,45 +151,47 @@ def select_device_chunks(
     )
 
 
-def replicate_device_pointers(
+def remap_device_pointers(
     device_ptrs: DevicePointers,
     data_ref_tensors: Sequence[Sequence[int]],
+    sources: Sequence[Sequence[tuple[int, int]]],
     own_bases: Sequence[int],
     bases: Sequence[Sequence[int]],
 ) -> DevicePointers:
-    """Pointers of the same blocks in each of several copies of the tensors,
-    laid out copy by copy within each group, as refs replicated with
-    tensor_idx + copy * num_tensors are.
+    """Pointers of the same blocks in other copies of the tensors, which hold
+    them at the same offsets (e.g. other workers' KV caches mapped through
+    CUDA IPC).
 
     Args:
         device_ptrs: Pointers into the tensors at own_bases.
-        data_ref_tensors: Per group, the tensor index of each data ref.
+        data_ref_tensors: Per group, the tensor index of each data ref of
+            device_ptrs.
+        sources: Per group, for each data ref of the result, the copy it is
+            in and the data ref of device_ptrs it stands for.
         own_bases: Base address of each tensor device_ptrs points into.
         bases: Per copy, the base address of each tensor.
 
     """
-    num_copies = len(bases)
     ptrs: list[np.ndarray] = []
     sizes: list[np.ndarray] = []
     dev_ptr_offset = 0
-    for group_size, tensor_ids in zip(device_ptrs.group_block_counts, data_ref_tensors):
-        assert len(tensor_ids) > 0
-        for copy_bases in bases:
-            for d, t_idx in enumerate(tensor_ids):
-                ref_offset = dev_ptr_offset + d * group_size
-                own = device_ptrs.ptrs[ref_offset : ref_offset + group_size]
-                ptrs.append(
-                    own - np.uint64(own_bases[t_idx]) + np.uint64(copy_bases[t_idx])
-                )
-                sizes.append(device_ptrs.sizes[ref_offset : ref_offset + group_size])
+    for group_size, tensor_ids, group_sources in zip(
+        device_ptrs.group_block_counts, data_ref_tensors, sources
+    ):
+        for copy_idx, d in group_sources:
+            t_idx = tensor_ids[d]
+            ref_offset = dev_ptr_offset + d * group_size
+            own = device_ptrs.ptrs[ref_offset : ref_offset + group_size]
+            ptrs.append(
+                own - np.uint64(own_bases[t_idx]) + np.uint64(bases[copy_idx][t_idx])
+            )
+            sizes.append(device_ptrs.sizes[ref_offset : ref_offset + group_size])
         dev_ptr_offset += group_size * len(tensor_ids)
     empty = np.empty(0, dtype=np.uint64)
     return DevicePointers(
         ptrs=np.concatenate(ptrs) if ptrs else empty,
         sizes=np.concatenate(sizes) if sizes else empty,
         group_block_counts=device_ptrs.group_block_counts,
-        group_data_ref_counts=tuple(
-            n * num_copies for n in device_ptrs.group_data_ref_counts
-        ),
+        group_data_ref_counts=tuple(len(group) for group in sources),
         block_indices=device_ptrs.block_indices,
     )
