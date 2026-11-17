@@ -153,6 +153,9 @@ class MockOffloadingSpec(OffloadingSpec):
         )
         self.manager.prepare_load = lambda keys, req_context: MockLoadStoreSpec(keys)
         self.manager.lookup.return_value = LookupResult.MISS
+        # As OffloadingManager: no promotion is ever pending.
+        self.manager.is_promotion_pending.return_value = False
+        self.manager.take_promotion_results.return_value = ((), ())
         self.manager.get_load_source.return_value = CacheHitSource.EXTERNAL_UNSPECIFIED
         self.manager.get_stats.return_value = None
         self.manager.config_info.return_value = [{}]
@@ -578,6 +581,8 @@ class RequestRunner:
             transfer_results = self.worker_connector.get_transfer_results(
                 scheduler_output.finished_req_ids
             )
+            # Map transfers to request blocks before a failed load frees them.
+            self._parse_transfers()
             worker_meta = (
                 self.worker_connector.build_connector_worker_meta()
                 or OffloadingWorkerMetadata()
