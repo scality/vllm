@@ -66,6 +66,8 @@ class OffloadingConnectorWorker:
         self._load_pieces_in_flight: dict[ReqId, int] = {}
         self._ended_loads: dict[ReqId, bool] = {}
         self._failed_recving: set[ReqId] = set()
+        # Requests with a failed load job whose other jobs are still in flight.
+        self._failed_load_reqs: set[ReqId] = set()
         self._unsubmitted_store_jobs: list[
             tuple[int, GPULoadStoreSpec, LoadStoreSpec]
         ] = []
@@ -294,9 +296,7 @@ class OffloadingConnectorWorker:
         assert self.worker is not None
         finished_recving: set[str] = set()
         for transfer_result in self.worker.get_finished():
-            # we currently do not support job failures
             job_id = transfer_result.job_id
-            assert transfer_result.success
             is_load = job_id in self._load_jobs
             if (
                 transfer_result.transfer_time is not None
@@ -311,22 +311,29 @@ class OffloadingConnectorWorker:
                     transfer_result.transfer_time,
                 )
 
-            self._connector_worker_meta.mark_completed(job_id)
+            self._connector_worker_meta.mark_completed(job_id, transfer_result.success)
             req_id = self._load_jobs.pop(job_id, None)
             if req_id is None:
                 continue
+            if not transfer_result.success:
+                self._failed_load_reqs.add(req_id)
             if req_id in self._load_pieces_in_flight:
                 self._load_pieces_in_flight[req_id] -= 1
                 if self._load_pieces_in_flight[req_id] == 0:
                     del self._load_pieces_in_flight[req_id]
             else:
                 finished_recving.add(req_id)
+                if req_id in self._failed_load_reqs:
+                    self._failed_load_reqs.discard(req_id)
+                    self._failed_recving.add(req_id)
 
         for req_id in [
             r for r in self._ended_loads if r not in self._load_pieces_in_flight
         ]:
             finished_recving.add(req_id)
-            if self._ended_loads.pop(req_id):
+            failed_piece = req_id in self._failed_load_reqs
+            self._failed_load_reqs.discard(req_id)
+            if self._ended_loads.pop(req_id) or failed_piece:
                 self._failed_recving.add(req_id)
 
         return set(), finished_recving
@@ -350,6 +357,7 @@ class OffloadingConnectorWorker:
         self._load_jobs.clear()
         self._load_pieces_in_flight.clear()
         self._ended_loads.clear()
+        self._failed_load_reqs.clear()
         self._connector_worker_meta = OffloadingWorkerMetadata()
         if self.worker is not None:
             self.worker.shutdown()

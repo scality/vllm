@@ -51,3 +51,17 @@ def test_aggregate_transfer_stats():
     assert result.transfer_stats.load.bytes == 30
     assert result.transfer_stats.load.time == 1.5
     assert result.transfer_stats.load.sizes == [10, 20, 30]
+
+
+def test_aggregate_keeps_failed_jobs_of_every_worker():
+    meta1 = OffloadingWorkerMetadata()
+    meta1.mark_completed(42, success=False)
+    meta1.mark_completed(7)
+    meta2 = OffloadingWorkerMetadata()
+    meta2.mark_completed(42)
+    meta2.mark_completed(7, success=False)
+
+    result = meta1.aggregate(meta2)
+
+    assert result.completed_jobs == {42: 2, 7: 2}
+    assert result.failed_jobs == {42, 7}

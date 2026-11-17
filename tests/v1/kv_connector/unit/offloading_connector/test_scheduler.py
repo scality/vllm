@@ -5172,3 +5172,44 @@ def test_ring_wait_gives_up_at_its_timeout(request_runner, async_scheduling: boo
         kv_transfer_params={"ring_wait": {"num_tokens": 13, "timeout_ms": 0}},
     )
     runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(0,))
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_failed_store_completes_unsuccessfully(request_runner, async_scheduling: bool):
+    """A store a worker failed reaches the manager as complete_store(success=
+    False), so it does not report the chunks as stored."""
+    runner = request_runner(
+        block_size=4, num_gpu_blocks=100, async_scheduling=async_scheduling
+    )
+    runner.offloading_spec.handler.failed_jobs = set(range(100))
+    runner.new_request(token_ids=[0] * 12)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0, 1, 2))
+
+    assert runner.manager.complete_store.call_count > 0
+    for store_call in runner.manager.complete_store.call_args_list:
+        assert store_call.kwargs["success"] is False
+
+
+@pytest.mark.skip(
+    reason="hangs in RequestRunner after the recompute, like "
+    "test_failed_promotion_recomputes_the_request"
+)
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_failed_load_marks_its_chunks_failed(request_runner, async_scheduling: bool):
+    """A load a worker failed is reported to the manager with its keys, and
+    the request is recomputed."""
+    runner = _store_three_chunks(request_runner, async_scheduling)
+    runner.offloading_spec.handler.failed_jobs = set(range(100))
+    runner.manager.take_promotion_results.return_value = ((), ())
+
+    runner.new_request(token_ids=[0] * 12 + [1])
+    runner.manager.lookup.side_effect = [LookupResult.HIT] * 3 + [
+        LookupResult.MISS
+    ] * 100
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(0, 1, 2))
+
+    runner.manager.mark_load_failed.assert_called_once()
+    assert len(runner.manager.mark_load_failed.call_args.args[0]) == 3

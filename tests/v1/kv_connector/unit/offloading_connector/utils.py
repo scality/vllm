@@ -88,6 +88,8 @@ class MockOffloadingWorker(OffloadingWorker):
         self.waiting_jobs: set[int] = set()
         self.completed_jobs: list[int] = []
         self.flushed_jobs: set[int] = set()
+        # Jobs that complete as failed.
+        self.failed_jobs: set[int] = set()
 
     def get_finished(self) -> list[TransferResult]:
         finished = self.completed_transfers
@@ -115,7 +117,7 @@ class MockOffloadingWorker(OffloadingWorker):
                 self.completed_jobs.append(job_id)
                 result = TransferResult(
                     job_id=job_id,
-                    success=True,
+                    success=job_id not in self.failed_jobs,
                     transfer_size=None,
                     transfer_time=None,
                 )

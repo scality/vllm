@@ -31,6 +31,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingManager,
     OffloadingSpec,
     OffloadingWorker,
+    TransferResult,
 )
 from vllm.v1.kv_offload.config import (
     OffloadingCacheConfig,
@@ -274,6 +275,24 @@ def test_start_kv_transfers_non_writer_still_submits_load():
     assert worker.worker is not None
     worker.worker.submit_load.assert_called_once()
     assert worker.build_connector_worker_meta() is None
+
+
+def test_failed_load_fails_its_request():
+    """A load the offloading worker failed finishes the request as failed, so
+    the scheduler recomputes it, and is reported as a failed job."""
+    worker, _ = _make_worker(
+        KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+    )
+    worker.start_kv_transfers(_load_metadata(11))
+    assert worker.worker is not None
+    worker.worker.get_finished.return_value = [TransferResult(11, success=False)]
+
+    assert worker.get_finished(set()) == (set(), {"req"})
+    assert worker.take_failed_recving() == {"req"}
+    meta = worker.build_connector_worker_meta()
+    assert meta is not None
+    assert meta.completed_jobs == {11: 1}
+    assert meta.failed_jobs == {11}
 
 
 def test_offloading_connector_worker_accepts_plugin_spec_default_layout():

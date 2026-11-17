@@ -311,7 +311,8 @@ class SingleDirectionOffloadingHandler:
         Args:
             gpu_tensors: list of GPU KV cache tensors.
                 Each of shape (num_gpu_blocks, gpu_page_size_bytes) with dtype int8.
-            cpu_tensors: list of CPU KV cache tensors.
+            cpu_tensors: list of offloaded KV cache tensors, in CPU memory or
+                on the device of gpu_tensors (a staging buffer).
                 Each of shape (num_cpu_chunks, cpu_page_size_bytes) with dtype int8.
                 Order should match gpu_tensors.
             blocks_per_chunk: number of blocks transferred per chunk.
@@ -341,7 +342,9 @@ class SingleDirectionOffloadingHandler:
             assert gpu_tensor.is_cuda or gpu_tensor.is_xpu
             assert cpu_tensor.dtype == torch.int8
             assert cpu_tensor.ndim == 2
-            assert cpu_tensor.device.type == "cpu"
+            assert cpu_tensor.device.type == "cpu" or (
+                cpu_tensor.device == gpu_tensor.device
+            )
             _, gpu_page_size = gpu_tensor.shape
             _, cpu_page_size = cpu_tensor.shape
             if canonical_bytes_per_block is not None:

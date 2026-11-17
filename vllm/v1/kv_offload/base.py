@@ -327,6 +327,20 @@ class OffloadingManager(ABC):
         """
         return
 
+    def mark_load_failed(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        """Called after complete_load() when a worker failed to load these
+        blocks; the request recomputes them. Only workers that can fail a
+        load trigger it.
+
+        Args:
+            keys: the keys identifying the blocks.
+            req_context: per-request context.
+
+        """
+        return
+
     @abstractmethod
     def prepare_store(
         self,

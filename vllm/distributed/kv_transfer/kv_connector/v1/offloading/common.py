@@ -86,14 +86,18 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
     (load or store). aggregate() sums counts across workers within a step.
     The scheduler accumulates across steps and processes
     a transfer completion only when count reaches num_workers.
+    A job in failed_jobs failed on at least one worker.
     """
 
     completed_jobs: dict[int, int] = field(default_factory=dict)
     transfer_stats: TransferStats = field(default_factory=TransferStats)
+    failed_jobs: set[int] = field(default_factory=set)
 
-    def mark_completed(self, job_id: int) -> None:
+    def mark_completed(self, job_id: int, success: bool = True) -> None:
         """Record a transfer job completion from this worker."""
         self.completed_jobs[job_id] = 1
+        if not success:
+            self.failed_jobs.add(job_id)
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -107,4 +111,5 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
         return OffloadingWorkerMetadata(
             completed_jobs=merged,
             transfer_stats=self.transfer_stats.aggregate(other.transfer_stats),
+            failed_jobs=self.failed_jobs | other.failed_jobs,
         )
