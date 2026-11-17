@@ -34,12 +34,13 @@ from vllm.v1.kv_offload.config import (
     OffloadingModelConfig,
     OffloadingParallelConfig,
 )
+from vllm.v1.kv_offload.obj.client import ObjStoreClient
+from vllm.v1.kv_offload.obj.config import ObjStoreConfig
 from vllm.v1.kv_offload.tiering.base import JobResult, TransferJob
 from vllm.v1.kv_offload.tiering.manager import (
     CPUPrimaryTierOffloadingManager,
     TieringOffloadingManager,
 )
-from vllm.v1.kv_offload.tiering.obj.config import ObjStoreConfig
 from vllm.v1.kv_offload.tiering.obj.manager import ObjectStoreSecondaryTierManager
 
 # ---------------------------------------------------------------------------
@@ -259,16 +260,16 @@ def _make_tier(
         tensor = torch.zeros((num_blocks, _BLOCK_ELEMENTS), dtype=_DTYPE)
         primary_kv_view = memoryview(tensor.numpy())
     ctx = [
-        patch("vllm.v1.kv_offload.tiering.obj.manager.nixl_agent_config"),
+        patch("vllm.v1.kv_offload.obj.client.nixl_agent_config"),
         patch(
-            "vllm.v1.kv_offload.tiering.obj.manager.nixl_agent",
+            "vllm.v1.kv_offload.obj.client.nixl_agent",
             return_value=mock_agent,
         ),
     ]
     if max_reg_bytes is not None:
         ctx.append(
             patch(
-                "vllm.v1.kv_offload.tiering.obj.manager.MAX_REG_BYTES",
+                "vllm.v1.kv_offload.obj.client.MAX_REG_BYTES",
                 max_reg_bytes,
             )
         )
@@ -293,7 +294,7 @@ def drain(
     results: list[JobResult] = []
     for _ in range(max_rounds):
         results.extend(tier.get_finished_jobs())
-        if not tier._transfers:
+        if not tier._client._transfers:
             break
     return results
 
@@ -429,11 +430,11 @@ class TestMockObjTierBasic:
         self.agent.check_xfer_state = delayed
 
         self.tier.submit_store(make_job(1, [key(1)], [0]))
-        assert self.tier._transfers  # in flight
+        assert self.tier._client._transfers  # in flight
 
         self.tier.drain_jobs()
 
-        assert not self.tier._transfers  # fully drained
+        assert not self.tier._client._transfers  # fully drained
         assert call_count[0] >= 3  # polled past the initial PROC responses
         # Result is buffered for the next get_finished_jobs() call.
         results = list(self.tier.get_finished_jobs())
@@ -530,7 +531,7 @@ class TestMockObjTierFailures:
         # The transfer handle could not be released safely, so the job must
         # remain tracked and must not be finalized yet.
         assert list(tier.get_finished_jobs()) == []
-        assert 1 in tier._transfers
+        assert 1 in tier._client._transfers
 
         # Cleanup is retried without polling again or changing the failure
         # verdict. The completion is then returned exactly once.
@@ -540,7 +541,7 @@ class TestMockObjTierFailures:
         assert not results[0].success
         assert agent.check_xfer_state.call_count == 2
         assert release_xfer.call_count == 2
-        assert not tier._transfers
+        assert not tier._client._transfers
         assert list(tier.get_finished_jobs()) == []
 
     @pytest.mark.parametrize(
@@ -562,16 +563,14 @@ class TestMockObjTierFailures:
         assert len(results) == 1
         assert results[0].job_id == 1
         assert results[0].success
-        assert not tier._transfers
+        assert not tier._client._transfers
         assert list(tier.get_finished_jobs()) == []
 
     def test_agent_created_with_telemetry(self):
         with (
+            patch("vllm.v1.kv_offload.obj.client.nixl_agent_config") as agent_config,
             patch(
-                "vllm.v1.kv_offload.tiering.obj.manager.nixl_agent_config"
-            ) as agent_config,
-            patch(
-                "vllm.v1.kv_offload.tiering.obj.manager.nixl_agent",
+                "vllm.v1.kv_offload.obj.client.nixl_agent",
                 return_value=MockNixlAgent(),
             ),
         ):
@@ -603,7 +602,7 @@ class TestMockObjTierFailures:
         assert results[0].success
         assert results[0].transfer_time is None
         release_xfer.assert_called_once()
-        assert not tier._transfers
+        assert not tier._client._transfers
 
     def test_xfer_cleanup_retry_finalizes_parent_job_and_primary_pin(self, monkeypatch):
         num_blocks = 4
@@ -644,14 +643,14 @@ class TestMockObjTierFailures:
 
         assert len(manager._transfer_jobs) == 1
         assert block.ref_cnt == 1
-        assert len(obj_tier._transfers) == 1
+        assert len(obj_tier._client._transfers) == 1
         assert manager.has_pending_work()
 
         manager.on_schedule_end(schedule_context)
 
         assert manager._transfer_jobs == {}
         assert block.ref_cnt == 0
-        assert obj_tier._transfers == {}
+        assert obj_tier._client._transfers == {}
         assert not manager.has_pending_work()
         assert agent.check_xfer_state.call_count == 2
         assert release_xfer.call_count == 2
@@ -663,11 +662,11 @@ class TestMockObjTierShutdown:
         # Keep transfer in flight by never completing it
         agent.check_xfer_state = lambda h: "PROC"
         tier.submit_store(make_job(1, [key(1)], [0]))
-        assert len(tier._transfers) == 1
+        assert len(tier._client._transfers) == 1
         tier.shutdown()
-        assert len(tier._transfers) == 0
-        assert tier._dram_prepped_handle is None
-        assert tier._primary_regs == []
+        assert len(tier._client._transfers) == 0
+        assert tier._client._local_handle is None
+        assert tier._client._local_regs == []
 
     def test_shutdown_idempotent(self):
         tier, _ = _make_tier(num_blocks=4)
@@ -955,7 +954,7 @@ class TestObjTierChunkedRegistration:
         # Whole buffer fits in one registration under the default 4 GiB cap.
         assert len(agent.dram_regs) == 1
         assert agent.dram_regs[0][1] == 4 * _STRIDE
-        assert len(tier._primary_regs) == 1
+        assert len(tier._client._local_regs) == 1
 
     def test_multiple_chunks_block_aligned(self):
         # 2048-byte cap with 1024-byte blocks => 2 blocks per chunk.
@@ -973,7 +972,7 @@ class TestObjTierChunkedRegistration:
             assert addr == base + offset
             offset += length
         assert offset == 8 * _STRIDE
-        assert len(tier._primary_regs) == 4
+        assert len(tier._client._local_regs) == 4
 
     def test_roundtrip_across_chunk_boundary(self):
         tier, _ = _make_tier(num_blocks=8, max_reg_bytes=2 * _STRIDE)
@@ -992,9 +991,36 @@ class TestObjTierChunkedRegistration:
 
     def test_shutdown_deregisters_all_chunks(self):
         tier, agent = _make_tier(num_blocks=8, max_reg_bytes=2 * _STRIDE)
-        assert len(tier._primary_regs) == 4
+        assert len(tier._client._local_regs) == 4
         tier.shutdown()
-        assert tier._primary_regs == []
+        assert tier._client._local_regs == []
+
+    def test_gpu_memory_registered_with_its_device(self):
+        """GPU slots carry the GPU ordinal, which the REST plugin uses to pick
+        the NICs close to that GPU."""
+        agent = MockNixlAgent()
+        with (
+            patch("vllm.v1.kv_offload.obj.client.nixl_agent_config"),
+            patch("vllm.v1.kv_offload.obj.client.nixl_agent", return_value=agent),
+        ):
+            client = ObjStoreClient("gpu", _REST_STORE_CONFIG, io_threads=1)
+        with (
+            patch.object(agent, "register_memory", wraps=agent.register_memory) as reg,
+            patch.object(agent, "prep_xfer_dlist") as prep,
+        ):
+            client.register_local(
+                base_addr=0x1000,
+                num_slots=3,
+                slot_bytes=_STRIDE,
+                mem_type="VRAM",
+                dev_id=5,
+            )
+        reg.assert_called_once_with([(0x1000, 3 * _STRIDE, 5, "")], "VRAM")
+        prep.assert_called_once_with(
+            "NIXL_INIT_AGENT",
+            [(0x1000 + i * _STRIDE, _STRIDE, 5) for i in range(3)],
+            "VRAM",
+        )
 
 
 def test_obj_tier_replicated_layout_collapses_mapper_identity():
@@ -1034,7 +1060,7 @@ def test_obj_tier_replicated_layout_collapses_mapper_identity():
 class TestObjTierAccelerated:
     def test_accelerated_tier_created(self):
         tier, _ = _make_tier(num_blocks=4, store_config=_ACCEL_STORE_CONFIG)
-        assert tier._is_accelerated is True
+        assert tier._client.is_accelerated is True
 
     def test_rest_tier_uses_rest_backend(self):
         """Backend creation and existence queries both target REST, not OBJ."""
