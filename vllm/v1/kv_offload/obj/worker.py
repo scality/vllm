@@ -17,7 +17,7 @@ import dataclasses
 import threading
 import time
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -60,6 +60,53 @@ def _sole_writer(ref: CanonicalKVCacheRef) -> CanonicalKVCacheRef:
         return ref
     mapping = dataclasses.replace(ref.mapping, num_writers=1, writer_index=0)
     return dataclasses.replace(ref, mapping=mapping)
+
+
+def _keep_all(ref: CanonicalKVCacheRef) -> bool:
+    return True
+
+
+def _first_writer(ref: CanonicalKVCacheRef) -> bool:
+    """Whether a store takes these bytes from this worker: one of the workers
+    holding them is enough."""
+    return ref.mapping is None or ref.mapping.writer_index == 0
+
+
+def _copy_handler(
+    tensors_per_rank: list[list[torch.Tensor]],
+    staging_per_rank: list[list[torch.Tensor]],
+    refs_per_rank: list[list[list[CanonicalKVCacheRef]]],
+    keep: Callable[[CanonicalKVCacheRef], bool],
+    blocks_per_chunk: int,
+    gpu_to_cpu: bool,
+    canonical_layout: bool,
+) -> SingleDirectionOffloadingHandler:
+    """One handler copying between the staging buffer and the KV caches of
+    several workers, which use the same block ids, through the refs kept."""
+    gpu_tensors: list[torch.Tensor] = []
+    staging_tensors: list[torch.Tensor] = []
+    refs: list[list[CanonicalKVCacheRef]] = [[] for _ in refs_per_rank[0]]
+    for tensors, staging, rank_refs in zip(
+        tensors_per_rank, staging_per_rank, refs_per_rank
+    ):
+        kept = [[ref for ref in group if keep(ref)] for group in rank_refs]
+        used = sorted({ref.tensor_idx for group in kept for ref in group})
+        index = {t: len(gpu_tensors) + i for i, t in enumerate(used)}
+        gpu_tensors += [tensors[t] for t in used]
+        staging_tensors += [staging[t] for t in used]
+        for group_refs, group in zip(refs, kept):
+            group_refs += [
+                dataclasses.replace(_sole_writer(ref), tensor_idx=index[ref.tensor_idx])
+                for ref in group
+            ]
+    return SingleDirectionOffloadingHandler(
+        gpu_tensors=gpu_tensors,
+        cpu_tensors=staging_tensors,
+        blocks_per_chunk=blocks_per_chunk,
+        layer_refs_per_group=refs,
+        gpu_to_cpu=gpu_to_cpu,
+        canonical_layout=canonical_layout,
+    )
 
 
 def select_gpu_chunks(
@@ -145,7 +192,7 @@ class ObjOffloadingWorker(OffloadingWorker):
         kv_caches: CanonicalKVCaches,
         blocks_per_chunk: int,
         chunk_bytes: int,
-        page_offset: int,
+        rank_page_bytes: int,
         canonical_layout: bool,
         store_config: dict,
         io_threads: int,
@@ -154,24 +201,27 @@ class ObjOffloadingWorker(OffloadingWorker):
         rank: int = 0,
         world_size: int = 1,
         all_gather: AllGather | None = None,
+        replicated: bool = False,
     ):
         """Args:
         kv_caches: Canonicalized KV caches.
         blocks_per_chunk: GPU blocks per chunk.
         chunk_bytes: Bytes of one object: a CPU tier chunk row, padding
             included.
-        page_offset: Offset of this worker's pages in a chunk, as in the CPU
-            tier (direct layout only).
+        rank_page_bytes: Bytes of a worker's pages in a chunk, worker r's
+            starting at r * rank_page_bytes as in the CPU tier (direct
+            layout); 0 for the canonical or replicated layouts.
         canonical_layout: Chunks use the canonical layout.
         store_config: Object store parameters (see ObjStoreConfig).
         io_threads: NIXL I/O threads.
         staging_bytes: Size of the staging buffer.
         agent_name: NIXL agent name.
         rank: This worker's rank.
-        world_size: Workers holding identical KV; more than one requires the
-            replicated layout.
+        world_size: Workers whose KV makes up a chunk, or hold it whole when
+            replicated.
         all_gather: Exchanges objects between the workers, required with
             more than one.
+        replicated: Every worker holds the whole chunk.
 
         """
         self._blocks_per_chunk = blocks_per_chunk
@@ -190,50 +240,52 @@ class ObjOffloadingWorker(OffloadingWorker):
         self._staging = torch.empty(
             (num_slots, chunk_bytes), dtype=torch.int8, device=self._device
         )
-        gpu_tensors, staging_tensors = self._build_views(
-            kv_caches, blocks_per_chunk, page_offset, canonical_layout
-        )
-        # A chunk's owner moves all of it: no writer rotation between workers.
-        refs = [
-            [_sole_writer(ref) for ref in group_refs]
-            for group_refs in kv_caches.group_data_refs
+        gpu_tensors = [
+            t.tensor.view(torch.int8).view((-1, t.page_size_bytes))
+            for t in kv_caches.tensors
         ]
-        self._store_copies = SingleDirectionOffloadingHandler(
-            gpu_tensors=gpu_tensors,
-            cpu_tensors=staging_tensors,
-            blocks_per_chunk=blocks_per_chunk,
-            layer_refs_per_group=refs,
-            gpu_to_cpu=True,
-            canonical_layout=canonical_layout,
+        staging_page_sizes = self._staging_page_sizes(
+            kv_caches, blocks_per_chunk, canonical_layout
         )
         self._fence: CrossRankFence | None = None
-        if world_size > 1:
+        # Stores read other workers' KV caches.
+        self._sharded = world_size > 1 and not replicated
+        if world_size == 1:
+            all_tensors = [gpu_tensors]
+            all_refs = [kv_caches.group_data_refs]
+        else:
             assert all_gather is not None
-            # A load writes every worker's copy: the same copies, once per
-            # worker's tensors.
             all_tensors = share_tensors(gpu_tensors, rank, all_gather)
-            num_tensors = len(gpu_tensors)
-            gpu_tensors = [t for tensors in all_tensors for t in tensors]
-            staging_tensors = staging_tensors * world_size
-            refs = [
-                [
-                    dataclasses.replace(
-                        ref, tensor_idx=ref.tensor_idx + r * num_tensors
-                    )
-                    for r in range(world_size)
-                    for ref in group_refs
-                ]
-                for group_refs in refs
-            ]
+            all_refs = all_gather(kv_caches.group_data_refs)
             self._fence = CrossRankFence(rank, world_size, all_gather)
-        self._load_copies = SingleDirectionOffloadingHandler(
-            gpu_tensors=gpu_tensors,
-            cpu_tensors=staging_tensors,
-            blocks_per_chunk=blocks_per_chunk,
-            layer_refs_per_group=refs,
-            gpu_to_cpu=False,
-            canonical_layout=canonical_layout,
-        )
+        all_staging = [
+            self._staging_views(staging_page_sizes, r * rank_page_bytes)
+            for r in range(world_size)
+        ]
+
+        def copies(
+            ranks: list[int], gpu_to_cpu: bool
+        ) -> SingleDirectionOffloadingHandler:
+            # A sharded store needs one copy of canonical bytes several
+            # workers hold; a load writes them in every worker.
+            if gpu_to_cpu and self._sharded and canonical_layout:
+                keep = _first_writer
+            else:
+                keep = _keep_all
+            return _copy_handler(
+                [all_tensors[r] for r in ranks],
+                [all_staging[r] for r in ranks],
+                [all_refs[r] for r in ranks],
+                keep,
+                blocks_per_chunk,
+                gpu_to_cpu,
+                canonical_layout,
+            )
+
+        # A replicated chunk is stored from the owner's own copy.
+        store_ranks = list(range(world_size)) if self._sharded else [rank]
+        self._store_copies = copies(store_ranks, gpu_to_cpu=True)
+        self._load_copies = copies(list(range(world_size)), gpu_to_cpu=False)
 
         self._client = ObjStoreClient(agent_name, store_config, io_threads)
         try:
@@ -260,6 +312,9 @@ class ObjOffloadingWorker(OffloadingWorker):
         self._jobs: dict[int, _Job] = {}
         self._waiting_loads: deque[_Job] = deque()
         self._waiting_stores: deque[_Job] = deque()
+        # Sharded: store jobs in submission order, None for those this worker
+        # owns nothing of, until they have read the KV caches.
+        self._uncopied_stores: deque[tuple[int, _Job | None]] = deque()
         self._pieces: dict[int, _Piece] = {}
         self._next_piece_id = 0
         self._results: list[TransferResult] = []
@@ -273,42 +328,33 @@ class ObjOffloadingWorker(OffloadingWorker):
         )
         self._thread.start()
 
-    def _build_views(
-        self,
-        kv_caches: CanonicalKVCaches,
-        blocks_per_chunk: int,
-        page_offset: int,
-        canonical_layout: bool,
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        """Views of the KV cache and of the staging buffer, the latter laid
-        out like a CPU tier chunk row (see SharedOffloadRegion)."""
-        canonical_bytes_per_block = (
-            _canonical_block_sizes(kv_caches.group_data_refs, len(kv_caches.tensors))
-            if canonical_layout
-            else None
-        )
-        offset = 0 if canonical_layout else page_offset
-        gpu_tensors: list[torch.Tensor] = []
-        staging_tensors: list[torch.Tensor] = []
-        for t_idx, kv_cache_tensor in enumerate(kv_caches.tensors):
-            page_size = kv_cache_tensor.page_size_bytes
-            gpu_tensors.append(
-                kv_cache_tensor.tensor.view(torch.int8).view((-1, page_size))
+    @staticmethod
+    def _staging_page_sizes(
+        kv_caches: CanonicalKVCaches, blocks_per_chunk: int, canonical_layout: bool
+    ) -> list[int]:
+        if canonical_layout:
+            sizes = _canonical_block_sizes(
+                kv_caches.group_data_refs, len(kv_caches.tensors)
             )
-            if canonical_bytes_per_block is not None:
-                chunk_page_size = canonical_bytes_per_block[t_idx] * blocks_per_chunk
-            else:
-                chunk_page_size = page_size * blocks_per_chunk
-            assert offset + chunk_page_size <= self._chunk_bytes
-            staging_tensors.append(
+        else:
+            sizes = [t.page_size_bytes for t in kv_caches.tensors]
+        return [size * blocks_per_chunk for size in sizes]
+
+    def _staging_views(self, page_sizes: list[int], offset: int) -> list[torch.Tensor]:
+        """Views of the staging buffer laid out like a CPU tier chunk row (see
+        SharedOffloadRegion), a worker's pages starting at offset."""
+        views: list[torch.Tensor] = []
+        for page_size in page_sizes:
+            assert offset + page_size <= self._chunk_bytes
+            views.append(
                 self._staging.as_strided(
-                    (self._staging.shape[0], chunk_page_size),
+                    (self._staging.shape[0], page_size),
                     (self._chunk_bytes, 1),
                     storage_offset=offset,
                 )
             )
-            offset += chunk_page_size
-        return gpu_tensors, staging_tensors
+            offset += page_size
+        return views
 
     # Engine thread
 
@@ -333,7 +379,7 @@ class ObjOffloadingWorker(OffloadingWorker):
     ) -> bool:
         ready = torch.Event()
         ready.record()
-        if not is_store and self._fence is not None:
+        if self._fence is not None and (self._sharded or not is_store):
             self._fence.publish(job_id)
         chunks = [
             i
@@ -344,6 +390,9 @@ class ObjOffloadingWorker(OffloadingWorker):
             job_id, is_store, gpu_spec, obj_names, ready, time.perf_counter(), chunks
         )
         with self._cond:
+            if is_store and self._sharded:
+                self._uncopied_stores.append((job_id, job if chunks else None))
+                self._publish_copied()
             if not chunks or self._broken:
                 self._results.append(TransferResult(job_id, not self._broken))
                 return True
@@ -353,14 +402,27 @@ class ObjOffloadingWorker(OffloadingWorker):
             self._cond.notify_all()
         return True
 
+    def _publish_copied(self) -> None:
+        """Publish how far this worker's stores have read the KV caches."""
+        assert self._fence is not None
+        copied = None
+        while self._uncopied_stores:
+            job_id, job = self._uncopied_stores[0]
+            if job is not None and not (job.started and job.copying == 0):
+                break
+            self._uncopied_stores.popleft()
+            copied = job_id
+        if copied is not None:
+            self._fence.publish_copied(copied)
+
     def get_finished(self) -> list[TransferResult]:
         with self._cond:
             results, self._results = self._results, []
         return results
 
     def wait(self, job_ids: set[int]) -> None:
-        """Wait until these stores have read the KV cache, and these loads have
-        completed."""
+        """Wait until these stores have read the KV caches, and these loads
+        have completed. Sharded, the stores other workers own included."""
 
         def settled(job: _Job | None) -> bool:
             if job is None:
@@ -371,6 +433,9 @@ class ObjOffloadingWorker(OffloadingWorker):
             self._cond.wait_for(
                 lambda: all(settled(self._jobs.get(j)) for j in job_ids)
             )
+        if self._sharded and job_ids:
+            assert self._fence is not None
+            self._fence.wait_copied(max(job_ids), _FENCE_TIMEOUT_S)
 
     def shutdown(self) -> None:
         with self._cond:
@@ -433,6 +498,8 @@ class ObjOffloadingWorker(OffloadingWorker):
                 self._copy(obj_result.job_id, piece)
         self._start_pieces(self._waiting_loads)
         self._start_pieces(self._waiting_stores)
+        if self._sharded:
+            self._publish_copied()
 
     def _start_pieces(self, waiting: deque[_Job]) -> None:
         while waiting and self._free_slots:
@@ -471,14 +538,14 @@ class ObjOffloadingWorker(OffloadingWorker):
         slots = StagingSlots(piece.slots)
         with current_platform.stream(self._stream):
             self._stream.wait_event(job.ready)
+            # Workers use the same block ids: the handlers copy them in every
+            # worker's tensors, once each has received the job.
+            if self._fence is not None and (self._sharded or not job.is_store):
+                self._fence.wait(job.job_id, self._stream, _FENCE_TIMEOUT_S)
             if job.is_store:
                 job.copying += 1
                 self._store_copies.transfer_async(piece_id, gpu_spec, slots)
             else:
-                if self._fence is not None:
-                    # Workers use the same block ids: the handler writes them
-                    # in every worker's tensors.
-                    self._fence.wait(job.job_id, self._stream, _FENCE_TIMEOUT_S)
                 self._load_copies.transfer_async(piece_id, slots, gpu_spec)
 
     def _finish_piece(self, piece_id: int) -> None:

@@ -11,6 +11,8 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
     CanonicalKVCacheTensor,
+    CanonicalPageMapping,
+    CopyRun,
     GPULoadStoreSpec,
     TransferResult,
 )
@@ -121,7 +123,7 @@ def worker(kv: torch.Tensor):
             kv_caches=kv_caches,
             blocks_per_chunk=BLOCKS_PER_CHUNK,
             chunk_bytes=CHUNK_BYTES,
-            page_offset=0,
+            rank_page_bytes=0,
             canonical_layout=False,
             store_config={},
             io_threads=1,
@@ -209,7 +211,7 @@ def _replicated_worker(rank: int, port: int, result_queue) -> None:
             kv_caches=kv_caches,
             blocks_per_chunk=BLOCKS_PER_CHUNK,
             chunk_bytes=CHUNK_BYTES,
-            page_offset=0,
+            rank_page_bytes=0,
             canonical_layout=False,
             store_config={},
             io_threads=1,
@@ -218,6 +220,7 @@ def _replicated_worker(rank: int, port: int, result_queue) -> None:
             rank=rank,
             world_size=2,
             all_gather=all_gather,
+            replicated=True,
         )
     worker._client.staging = worker._staging
     names = ObjLoadStoreSpec([f"chunk{i}" for i in range(4)])
@@ -263,4 +266,128 @@ def test_replicated_workers_share_out_the_chunks():
     assert all(stored and loaded for _, stored, loaded, _, _ in results)
     assert results[0][3] | results[1][3] == names
     assert not results[0][3] & results[1][3]
+    assert all(kv_equal for *_, kv_equal in results)
+
+
+def _sharded_kv(rank: int) -> torch.Tensor:
+    """Worker rank's half of the KV: different on every worker."""
+    gen = torch.Generator().manual_seed(rank + 1)
+    return torch.randint(-128, 127, (16, PAGE), dtype=torch.int8, generator=gen)
+
+
+def _interleaving_mapping(rank: int) -> CanonicalPageMapping:
+    """Each worker's page cut into 4 fragments, interleaved with the other
+    worker's in a canonical page of both, as heads sharded by TP are."""
+    fragment = PAGE // 4
+    return CanonicalPageMapping(
+        canonical_page_size_bytes=2 * PAGE,
+        local_page_size_bytes=PAGE,
+        runs=(
+            CopyRun(
+                local_offset=0,
+                canonical_offset=rank * fragment,
+                fragment_size=fragment,
+                num_fragments=4,
+                local_stride=fragment,
+                canonical_stride=2 * fragment,
+            ),
+        ),
+        num_writers=1,
+        writer_index=0,
+        parallelism_agnostic=True,
+    )
+
+
+def _expected_object(chunk: int, canonical: bool) -> torch.Tensor:
+    """The object of chunk (blocks 2 * chunk and 2 * chunk + 1)."""
+    pages = [_sharded_kv(r)[2 * chunk : 2 * chunk + 2] for r in range(2)]
+    if canonical:
+        fragments = [p.view(BLOCKS_PER_CHUNK, 4, PAGE // 4) for p in pages]
+        body = torch.stack(fragments, dim=2).reshape(-1)
+    else:
+        body = torch.cat([p.reshape(-1) for p in pages])
+    obj = torch.zeros(CHUNK_BYTES, dtype=torch.int8)
+    obj[: body.numel()] = body
+    return obj
+
+
+def _sharded_worker(rank: int, port: int, canonical: bool, result_queue) -> None:
+    import torch.distributed as dist
+
+    torch.accelerator.set_device_index(rank)
+    dist.init_process_group(
+        "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2
+    )
+
+    def all_gather(obj):
+        gathered = [None, None]
+        dist.all_gather_object(gathered, obj)
+        return gathered
+
+    kv = _sharded_kv(rank).cuda()
+    mapping = _interleaving_mapping(rank) if canonical else None
+    kv_caches = CanonicalKVCaches(
+        tensors=[CanonicalKVCacheTensor(kv, PAGE)],
+        group_data_refs=[[CanonicalKVCacheRef(0, PAGE, mapping)]],
+    )
+    with patch("vllm.v1.kv_offload.obj.worker.ObjStoreClient", _FakeStore):
+        worker = ObjOffloadingWorker(
+            kv_caches=kv_caches,
+            blocks_per_chunk=BLOCKS_PER_CHUNK,
+            chunk_bytes=CHUNK_BYTES,
+            rank_page_bytes=0 if canonical else PAGE * BLOCKS_PER_CHUNK,
+            canonical_layout=canonical,
+            store_config={},
+            io_threads=1,
+            staging_bytes=2 * CHUNK_BYTES,
+            agent_name=f"test{rank}",
+            rank=rank,
+            world_size=2,
+            all_gather=all_gather,
+        )
+    worker._client.staging = worker._staging
+    names = ObjLoadStoreSpec([f"chunk{i}" for i in range(4)])
+    expected = kv[:8].clone()
+
+    worker.submit_store(1, _gpu_spec(list(range(8))), names)
+    worker.wait({1})  # every owner has read this worker's blocks
+    kv[:8] = 0  # so the store cannot have read them late
+    stored = _finish(worker, 1).success
+    dist.barrier()
+    worker.submit_load(2, names, _gpu_spec(list(range(8, 16))))
+    loaded = _finish(worker, 2).success
+    dist.barrier()  # every owner has written into every worker's KV cache
+    # Bytes: a tensor would go through shared memory gone with this process.
+    objects = {n: o.cpu().numpy().tobytes() for n, o in worker._client.objects.items()}
+    result_queue.put((rank, stored, loaded, objects, torch.equal(kv[8:16], expected)))
+    dist.barrier()
+    worker.shutdown()
+    dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 2, reason="needs 2 GPUs")
+@pytest.mark.parametrize("canonical", [False, True])
+def test_sharded_chunks_are_gathered_and_scattered(canonical: bool):
+    """With KV sharded across workers, a chunk's owner gathers every worker's
+    part into one object, laid out as the CPU tier lays it out, and a load
+    gives every worker its part back."""
+    import torch.multiprocessing as mp
+
+    from vllm.utils.network_utils import get_open_port
+
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    mp.spawn(
+        _sharded_worker,
+        args=(get_open_port(), canonical, result_queue),
+        nprocs=2,
+    )
+    results = sorted(result_queue.get() for _ in range(2))
+
+    assert all(stored and loaded for _, stored, loaded, _, _ in results)
+    objects = {**results[0][3], **results[1][3]}
+    assert sorted(objects) == [f"chunk{i}" for i in range(4)]
+    for i in range(4):
+        expected = _expected_object(i, canonical).numpy().tobytes()
+        assert objects[f"chunk{i}"] == expected
     assert all(kv_equal for *_, kv_equal in results)
