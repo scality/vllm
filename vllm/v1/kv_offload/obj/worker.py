@@ -7,8 +7,13 @@ the CPU tier's chunk layout, then PUTs each slot as one object over GPUDirect
 RDMA. A load GETs the objects into slots, then copies them into the KV cache.
 A job larger than the staging buffer goes through it in pieces. A driver
 thread moves pieces from one stage to the next as soon as each completes.
+
+With several workers holding identical KV (replicated layout), each chunk has
+one owner worker, which moves it alone: a store PUTs the owner's copy, a load
+writes the chunk into every worker's KV cache through CUDA IPC.
 """
 
+import dataclasses
 import threading
 import time
 from collections import deque
@@ -21,6 +26,7 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.kv_offload.base import (
     BlockIDsLoadStoreSpec,
+    CanonicalKVCacheRef,
     CanonicalKVCaches,
     DevicePointers,
     LoadStoreSpec,
@@ -32,17 +38,30 @@ from vllm.v1.kv_offload.cpu.gpu_worker import (
     _canonical_block_sizes,
 )
 from vllm.v1.kv_offload.obj.client import NIXL_READ, NIXL_WRITE, ObjStoreClient
-from vllm.v1.kv_offload.obj.common import ObjLoadStoreSpec
-from vllm.v1.kv_offload.pointer_utils import slice_device_pointers
+from vllm.v1.kv_offload.obj.common import ObjLoadStoreSpec, owner_of
+from vllm.v1.kv_offload.obj.peers import AllGather, CrossRankFence, share_tensors
+from vllm.v1.kv_offload.pointer_utils import (
+    replicate_device_pointers,
+    select_device_chunks,
+)
 
 logger = init_logger(__name__)
 
 # How long the driver waits between polls while transfers are in flight.
 _POLL_INTERVAL_S = 1e-4
+# How long a load waits for the other workers to receive it.
+_FENCE_TIMEOUT_S = 30.0
 
 
 class StagingSlots(BlockIDsLoadStoreSpec):
     """Slots of the staging buffer, one per chunk."""
+
+
+def _sole_writer(ref: CanonicalKVCacheRef) -> CanonicalKVCacheRef:
+    if ref.mapping is None or ref.mapping.num_writers == 1:
+        return ref
+    mapping = dataclasses.replace(ref.mapping, num_writers=1, writer_index=0)
+    return dataclasses.replace(ref, mapping=mapping)
 
 
 @dataclass(eq=False)
@@ -55,6 +74,8 @@ class _Job:
     # before it, a load writes blocks that may still be being zeroed.
     ready: torch.Event
     submit_time: float
+    # Chunks this worker moves, indices into obj_names.
+    chunks: list[int]
     next_chunk: int = 0
     in_flight: int = 0
     # Store: pieces being copied out of the KV cache.
@@ -63,7 +84,7 @@ class _Job:
 
     @property
     def num_chunks(self) -> int:
-        return len(self.obj_names)
+        return len(self.chunks)
 
     @property
     def started(self) -> bool:
@@ -73,9 +94,13 @@ class _Job:
 @dataclass(eq=False)
 class _Piece:
     job: _Job
-    start: int
-    end: int
+    # Indices into job.obj_names.
+    chunks: list[int]
     slots: list[int]
+
+    @property
+    def obj_names(self) -> list[str]:
+        return [self.job.obj_names[c] for c in self.chunks]
 
 
 class ObjOffloadingWorker(OffloadingWorker):
@@ -90,6 +115,9 @@ class ObjOffloadingWorker(OffloadingWorker):
         io_threads: int,
         staging_bytes: int,
         agent_name: str,
+        rank: int = 0,
+        world_size: int = 1,
+        all_gather: AllGather | None = None,
     ):
         """Args:
         kv_caches: Canonicalized KV caches.
@@ -103,10 +131,17 @@ class ObjOffloadingWorker(OffloadingWorker):
         io_threads: NIXL I/O threads.
         staging_bytes: Size of the staging buffer.
         agent_name: NIXL agent name.
+        rank: This worker's rank.
+        world_size: Workers holding identical KV; more than one requires the
+            replicated layout.
+        all_gather: Exchanges objects between the workers, required with
+            more than one.
 
         """
         self._blocks_per_chunk = blocks_per_chunk
         self._chunk_bytes = chunk_bytes
+        self._rank = rank
+        self._world_size = world_size
         num_slots = staging_bytes // chunk_bytes
         if num_slots < 1:
             raise ValueError(
@@ -122,17 +157,52 @@ class ObjOffloadingWorker(OffloadingWorker):
         staging_tensors = self._build_views(
             kv_caches, blocks_per_chunk, page_offset, canonical_layout
         )
+        # A chunk's owner moves all of it: no writer rotation between workers.
+        refs = [
+            [_sole_writer(ref) for ref in group_refs]
+            for group_refs in kv_caches.group_data_refs
+        ]
         self._store_copies = SingleDirectionOffloadingHandler(
             cpu_tensors=staging_tensors,
             blocks_per_chunk=blocks_per_chunk,
-            layer_refs_per_group=kv_caches.group_data_refs,
+            layer_refs_per_group=refs,
             gpu_to_cpu=True,
             canonical_layout=canonical_layout,
         )
+        self._fence: CrossRankFence | None = None
+        if world_size > 1:
+            assert all_gather is not None
+            # A load writes every worker's copy: the same copies, once per
+            # worker's tensors, through pointers into each worker's tensors.
+            gpu_tensors = [
+                t.tensor.view(torch.int8).view((-1, t.page_size_bytes))
+                for t in kv_caches.tensors
+            ]
+            all_tensors = share_tensors(gpu_tensors, rank, all_gather)
+            num_tensors = len(gpu_tensors)
+            self._own_bases = [t.tensor.data_ptr() for t in kv_caches.tensors]
+            self._peer_bases = [
+                [t.data_ptr() for t in tensors] for tensors in all_tensors
+            ]
+            self._load_ref_tensors = [
+                [ref.tensor_idx for ref in group_refs] for group_refs in refs
+            ]
+            staging_tensors = staging_tensors * world_size
+            refs = [
+                [
+                    dataclasses.replace(
+                        ref, tensor_idx=ref.tensor_idx + r * num_tensors
+                    )
+                    for r in range(world_size)
+                    for ref in group_refs
+                ]
+                for group_refs in refs
+            ]
+            self._fence = CrossRankFence(rank, world_size, all_gather)
         self._load_copies = SingleDirectionOffloadingHandler(
             cpu_tensors=staging_tensors,
             blocks_per_chunk=blocks_per_chunk,
-            layer_refs_per_group=kv_caches.group_data_refs,
+            layer_refs_per_group=refs,
             gpu_to_cpu=False,
             canonical_layout=canonical_layout,
         )
@@ -238,9 +308,18 @@ class ObjOffloadingWorker(OffloadingWorker):
     ) -> bool:
         ready = torch.Event()
         ready.record()
-        job = _Job(job_id, is_store, device_ptrs, obj_names, ready, time.perf_counter())
+        if not is_store and self._fence is not None:
+            self._fence.publish(job_id)
+        chunks = [
+            i
+            for i, name in enumerate(obj_names)
+            if owner_of(name, self._world_size) == self._rank
+        ]
+        job = _Job(
+            job_id, is_store, device_ptrs, obj_names, ready, time.perf_counter(), chunks
+        )
         with self._cond:
-            if not obj_names or self._broken:
+            if not chunks or self._broken:
                 self._results.append(TransferResult(job_id, not self._broken))
                 return True
             self._jobs[job_id] = job
@@ -285,6 +364,8 @@ class ObjOffloadingWorker(OffloadingWorker):
             self._load_copies.shutdown()
         finally:
             self._client.shutdown()
+            if self._fence is not None:
+                self._fence.close()
 
     # Driver thread
 
@@ -313,7 +394,7 @@ class ObjOffloadingWorker(OffloadingWorker):
             self._client.submit(
                 result.job_id,
                 np.asarray(piece.slots, dtype=np.int32),
-                piece.job.obj_names[piece.start : piece.end],
+                piece.obj_names,
                 NIXL_WRITE,
             )
             self._cond.notify_all()
@@ -352,8 +433,9 @@ class ObjOffloadingWorker(OffloadingWorker):
             )
             slots = self._free_slots[-num_chunks:]
             del self._free_slots[-num_chunks:]
-            piece = _Piece(job, job.next_chunk, job.next_chunk + num_chunks, slots)
-            job.next_chunk = piece.end
+            end = job.next_chunk + num_chunks
+            piece = _Piece(job, job.chunks[job.next_chunk : end], slots)
+            job.next_chunk = end
             job.in_flight += 1
             piece_id = self._next_piece_id
             self._next_piece_id += 1
@@ -364,15 +446,15 @@ class ObjOffloadingWorker(OffloadingWorker):
                 self._client.submit(
                     piece_id,
                     np.asarray(slots, dtype=np.int32),
-                    job.obj_names[piece.start : piece.end],
+                    piece.obj_names,
                     NIXL_READ,
                 )
 
     def _copy(self, piece_id: int, piece: _Piece) -> None:
         """Copy a piece between the KV cache and its slots."""
         job = piece.job
-        device_ptrs = slice_device_pointers(
-            job.device_ptrs, self._blocks_per_chunk, piece.start, piece.end
+        device_ptrs = select_device_chunks(
+            job.device_ptrs, self._blocks_per_chunk, piece.chunks
         )
         slots = StagingSlots(piece.slots)
         with current_platform.stream(self._stream):
@@ -381,6 +463,16 @@ class ObjOffloadingWorker(OffloadingWorker):
                 job.copying += 1
                 self._store_copies.transfer_async(piece_id, device_ptrs, slots)
             else:
+                if self._fence is not None:
+                    # Workers use the same block ids: the handler writes them
+                    # in every worker's tensors.
+                    self._fence.wait(job.job_id, self._stream, _FENCE_TIMEOUT_S)
+                    device_ptrs = replicate_device_pointers(
+                        device_ptrs,
+                        self._load_ref_tensors,
+                        self._own_bases,
+                        self._peer_bases,
+                    )
                 self._load_copies.transfer_async(piece_id, device_ptrs, slots)
 
     def _fail_piece(self, piece_id: int, what: str) -> None:
@@ -401,7 +493,7 @@ class ObjOffloadingWorker(OffloadingWorker):
                 TransferResult(
                     job_id=job.job_id,
                     success=not job.failed,
-                    transfer_size=job.num_chunks * self._chunk_bytes,
+                    transfer_size=len(job.chunks) * self._chunk_bytes,
                     transfer_time=time.perf_counter() - job.submit_time,
                 )
             )

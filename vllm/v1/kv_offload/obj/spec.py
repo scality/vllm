@@ -15,7 +15,9 @@ reads what the other wrote. kv_connector_extra_config:
     reuse_notify: see ReuseNotifier.from_config
 
 Set kv_load_failure_policy to "recompute": a load fails when the store has
-evicted the chunk since it was looked up.
+evicted the chunk since it was looked up. With more than one worker, the KV
+must be replicated (MLA with canonical_layout); each chunk then has one owner
+worker that moves it for all.
 """
 
 from typing import Any
@@ -36,13 +38,26 @@ from vllm.v1.kv_offload.obj.client import ObjStoreClient
 from vllm.v1.kv_offload.obj.manager import ObjOffloadingManager
 
 
+def _tp_all_gather(obj: Any) -> list[Any]:
+    import torch.distributed
+
+    from vllm.distributed.parallel_state import get_tp_group
+
+    group = get_tp_group()
+    gathered: list[Any] = [None] * group.world_size
+    torch.distributed.all_gather_object(gathered, obj, group=group.cpu_group)
+    return gathered
+
+
 class ObjOffloadingSpec(OffloadingSpec):
     def __init__(self, config: OffloadingConfig):
         super().__init__(config)
         world_size = config.parallel.world_size
-        if world_size != 1:
+        if world_size != 1 and not config.replicated_layout:
             raise NotImplementedError(
-                f"ObjOffloadingSpec supports one worker only (world_size={world_size})"
+                "ObjOffloadingSpec supports several workers only with the "
+                f"replicated layout (world_size={world_size}); set "
+                "canonical_layout for an MLA model"
             )
         store_config: dict[str, Any] | None = self.extra_config.get("store_config")
         if not store_config:
@@ -101,15 +116,22 @@ class ObjOffloadingSpec(OffloadingSpec):
                     "canonical_layout was requested but the KV cache layout "
                     "could not be certified for canonical offload."
                 )
+            rank = self.config.parallel.rank
+            world_size = self.config.parallel.world_size
             self._worker = ObjOffloadingWorker(
                 kv_caches=kv_caches,
                 blocks_per_chunk=self.blocks_per_chunk,
                 chunk_bytes=self.chunk_bytes,
-                page_offset=self.config.parallel.rank * self.page_size_per_worker,
+                page_offset=0
+                if self.replicated_layout
+                else rank * self.page_size_per_worker,
                 canonical_layout=canonical_layout,
                 store_config=self.store_config,
                 io_threads=self.io_threads,
                 staging_bytes=self.staging_bytes,
-                agent_name=f"ObjWorkerAgent{self.config.parallel.rank}",
+                agent_name=f"ObjWorkerAgent{rank}",
+                rank=rank,
+                world_size=world_size,
+                all_gather=_tp_all_gather if world_size > 1 else None,
             )
         return self._worker

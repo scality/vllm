@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -101,17 +101,22 @@ def resolve_device_pointers(
     )
 
 
-def slice_device_pointers(
-    device_ptrs: DevicePointers, blocks_per_chunk: int, start: int, end: int
+def select_device_chunks(
+    device_ptrs: DevicePointers, blocks_per_chunk: int, chunks: Sequence[int]
 ) -> DevicePointers:
-    """The pointers of chunks [start, end) of a transfer, chunks being numbered
-    group by group as iter_pointer_groups() numbers them."""
+    """The pointers of these chunks of a transfer, in increasing order; chunks
+    are numbered group by group as iter_pointer_groups() numbers them.
+
+    Only a transfer's first chunk in a group can start mid-chunk and only its
+    last can end mid-chunk, so the blocks of the selected chunks of a group
+    fill their slots in order, as those of one transfer do."""
     ptrs: list[np.ndarray] = []
     sizes: list[np.ndarray] = []
     group_block_counts: list[int] = []
     block_indices: list[int] = []
     chunk_offset = 0
     dev_ptr_offset = 0
+    i = 0
     for group_size, n_data_refs, block_idx in zip(
         device_ptrs.group_block_counts,
         device_ptrs.group_data_ref_counts,
@@ -119,22 +124,23 @@ def slice_device_pointers(
     ):
         skip = block_idx % blocks_per_chunk
         n_chunks = cdiv(group_size + skip, blocks_per_chunk) if group_size else 0
-        first = max(start - chunk_offset, 0)
-        last = min(end - chunk_offset, n_chunks)
-        if first < last:
-            lo = max(first * blocks_per_chunk - skip, 0)
-            hi = min(last * blocks_per_chunk - skip, group_size)
-            for d in range(n_data_refs):
-                ref_offset = dev_ptr_offset + d * group_size
+        ranges: list[tuple[int, int]] = []
+        while i < len(chunks) and chunks[i] < chunk_offset + n_chunks:
+            chunk = chunks[i] - chunk_offset
+            lo = max(chunk * blocks_per_chunk - skip, 0)
+            hi = min((chunk + 1) * blocks_per_chunk - skip, group_size)
+            ranges.append((lo, hi))
+            i += 1
+        for d in range(n_data_refs):
+            ref_offset = dev_ptr_offset + d * group_size
+            for lo, hi in ranges:
                 ptrs.append(device_ptrs.ptrs[ref_offset + lo : ref_offset + hi])
                 sizes.append(device_ptrs.sizes[ref_offset + lo : ref_offset + hi])
-            group_block_counts.append(hi - lo)
-            block_indices.append(block_idx + lo)
-        else:
-            group_block_counts.append(0)
-            block_indices.append(block_idx)
+        group_block_counts.append(sum(hi - lo for lo, hi in ranges))
+        block_indices.append(block_idx + (ranges[0][0] if ranges else 0))
         chunk_offset += n_chunks
         dev_ptr_offset += group_size * n_data_refs
+    assert i == len(chunks)
     empty = np.empty(0, dtype=np.uint64)
     return DevicePointers(
         ptrs=np.concatenate(ptrs) if ptrs else empty,
@@ -142,4 +148,48 @@ def slice_device_pointers(
         group_block_counts=tuple(group_block_counts),
         group_data_ref_counts=device_ptrs.group_data_ref_counts,
         block_indices=tuple(block_indices),
+    )
+
+
+def replicate_device_pointers(
+    device_ptrs: DevicePointers,
+    data_ref_tensors: Sequence[Sequence[int]],
+    own_bases: Sequence[int],
+    bases: Sequence[Sequence[int]],
+) -> DevicePointers:
+    """Pointers of the same blocks in each of several copies of the tensors,
+    laid out copy by copy within each group, as refs replicated with
+    tensor_idx + copy * num_tensors are.
+
+    Args:
+        device_ptrs: Pointers into the tensors at own_bases.
+        data_ref_tensors: Per group, the tensor index of each data ref.
+        own_bases: Base address of each tensor device_ptrs points into.
+        bases: Per copy, the base address of each tensor.
+
+    """
+    num_copies = len(bases)
+    ptrs: list[np.ndarray] = []
+    sizes: list[np.ndarray] = []
+    dev_ptr_offset = 0
+    for group_size, tensor_ids in zip(device_ptrs.group_block_counts, data_ref_tensors):
+        assert len(tensor_ids) > 0
+        for copy_bases in bases:
+            for d, t_idx in enumerate(tensor_ids):
+                ref_offset = dev_ptr_offset + d * group_size
+                own = device_ptrs.ptrs[ref_offset : ref_offset + group_size]
+                ptrs.append(
+                    own - np.uint64(own_bases[t_idx]) + np.uint64(copy_bases[t_idx])
+                )
+                sizes.append(device_ptrs.sizes[ref_offset : ref_offset + group_size])
+        dev_ptr_offset += group_size * len(tensor_ids)
+    empty = np.empty(0, dtype=np.uint64)
+    return DevicePointers(
+        ptrs=np.concatenate(ptrs) if ptrs else empty,
+        sizes=np.concatenate(sizes) if sizes else empty,
+        group_block_counts=device_ptrs.group_block_counts,
+        group_data_ref_counts=tuple(
+            n * num_copies for n in device_ptrs.group_data_ref_counts
+        ),
+        block_indices=device_ptrs.block_indices,
     )
