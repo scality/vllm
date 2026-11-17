@@ -186,6 +186,7 @@ class SchedulerOffloadConfig(NamedTuple):
     num_workers: int
     offload_prompt_only: bool
     supports_partial_tail: bool
+    min_load_tokens: int = 0
     alignment_tokens: int | None = None
     retention_interval: int | None = None
     dcp_world_size: int = 1
@@ -344,6 +345,7 @@ class SchedulerOffloadConfig(NamedTuple):
             tokens_per_hash=spec.tokens_per_hash,
             offload_prompt_only=spec.offload_prompt_only,
             supports_partial_tail=supports_partial_tail,
+            min_load_tokens=spec.min_load_tokens,
             alignment_tokens=alignment_tokens,
             retention_interval=retention_interval,
             dcp_world_size=vllm_config.parallel_config.decode_context_parallel_size,
@@ -1182,6 +1184,8 @@ class OffloadingConnectorScheduler:
                 req_status, num_computed_tokens, num_hit_tokens
             ):
                 num_hit_tokens = None
+            if num_hit_tokens and num_hit_tokens < self.config.min_load_tokens:
+                num_hit_tokens = 0
             if num_hit_tokens is None:
                 if req_status.deferred_lookup_start_time is None:
                     req_status.deferred_lookup_start_time = lookup_start
