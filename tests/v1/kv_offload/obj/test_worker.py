@@ -15,8 +15,8 @@ from vllm.v1.kv_offload.base import (
     TransferResult,
 )
 from vllm.v1.kv_offload.obj.client import NIXL_WRITE, ObjTransferResult
-from vllm.v1.kv_offload.obj.common import ObjLoadStoreSpec
-from vllm.v1.kv_offload.obj.worker import ObjOffloadingWorker, slice_gpu_spec
+from vllm.v1.kv_offload.obj.common import ObjLoadStoreSpec, owner_of
+from vllm.v1.kv_offload.obj.worker import ObjOffloadingWorker, select_gpu_chunks
 
 
 def _blocks(spec: GPULoadStoreSpec) -> tuple[list[int], list[int], list[int]]:
@@ -29,8 +29,8 @@ def test_slice_starts_mid_chunk():
     a slice after it starts on a chunk boundary."""
     spec = GPULoadStoreSpec([10, 11, 12, 13, 14], group_sizes=[5], block_indices=[1])
 
-    assert _blocks(slice_gpu_spec(spec, 2, 0, 1)) == ([10], [1], [1])
-    assert _blocks(slice_gpu_spec(spec, 2, 1, 3)) == ([11, 12, 13, 14], [4], [2])
+    assert _blocks(select_gpu_chunks(spec, 2, [0])) == ([10], [1], [1])
+    assert _blocks(select_gpu_chunks(spec, 2, [1, 2])) == ([11, 12, 13, 14], [4], [2])
 
 
 @pytest.mark.cpu_test
@@ -39,8 +39,26 @@ def test_slice_numbers_chunks_group_by_group():
         [10, 11, 20, 21, 22], group_sizes=[2, 3], block_indices=[0, 0]
     )
 
-    assert _blocks(slice_gpu_spec(spec, 1, 1, 3)) == ([11, 20], [1, 1], [1, 0])
-    assert _blocks(slice_gpu_spec(spec, 1, 3, 5)) == ([21, 22], [0, 2], [0, 1])
+    assert _blocks(select_gpu_chunks(spec, 1, [1, 2])) == ([11, 20], [1, 1], [1, 0])
+    assert _blocks(select_gpu_chunks(spec, 1, [3, 4])) == ([21, 22], [0, 2], [0, 1])
+
+
+@pytest.mark.cpu_test
+def test_select_skips_chunks_owned_by_other_workers():
+    """The chunks a worker owns need not be consecutive; their blocks fill
+    its slots in order."""
+    spec = GPULoadStoreSpec([10, 11, 12, 13, 14], group_sizes=[5], block_indices=[1])
+
+    assert _blocks(select_gpu_chunks(spec, 2, [0, 2])) == ([10, 13, 14], [3], [1])
+
+
+@pytest.mark.cpu_test
+def test_every_chunk_has_one_owner_in_every_process():
+    names = [f"model/{i:03x}/{i}.bin" for i in range(64)]
+    owners = [owner_of(n, 8) for n in names]
+
+    assert owners == [owner_of(n, 8) for n in names]
+    assert set(owners) == set(range(8))
 
 
 class _FakeStore:
@@ -163,3 +181,86 @@ def test_wait_returns_once_the_kv_is_read(worker):
 def test_slots_are_shared_out_one_chunk_per_piece(worker):
     assert worker._max_piece_chunks == 1
     assert np.array_equal(worker._free_slots, [0])
+
+
+def _replicated_worker(rank: int, port: int, result_queue) -> None:
+    import torch.distributed as dist
+
+    torch.accelerator.set_device_index(rank)
+    dist.init_process_group(
+        "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2
+    )
+
+    def all_gather(obj):
+        gathered = [None, None]
+        dist.all_gather_object(gathered, obj)
+        return gathered
+
+    # Every worker holds the same KV, as with MLA.
+    gen = torch.Generator().manual_seed(0)
+    kv = torch.randint(-128, 127, (16, PAGE), dtype=torch.int8, generator=gen)
+    kv = kv.cuda()
+    kv_caches = CanonicalKVCaches(
+        tensors=[CanonicalKVCacheTensor(kv, PAGE)],
+        group_data_refs=[[CanonicalKVCacheRef(0, PAGE)]],
+    )
+    with patch("vllm.v1.kv_offload.obj.worker.ObjStoreClient", _FakeStore):
+        worker = ObjOffloadingWorker(
+            kv_caches=kv_caches,
+            blocks_per_chunk=BLOCKS_PER_CHUNK,
+            chunk_bytes=CHUNK_BYTES,
+            page_offset=0,
+            canonical_layout=False,
+            store_config={},
+            io_threads=1,
+            staging_bytes=2 * CHUNK_BYTES,
+            agent_name=f"test{rank}",
+            rank=rank,
+            world_size=2,
+            all_gather=all_gather,
+        )
+    worker._client.staging = worker._staging
+    names = ObjLoadStoreSpec([f"chunk{i}" for i in range(4)])
+    expected = kv[:8].clone()
+
+    worker.submit_store(1, _gpu_spec(list(range(8))), names)
+    stored = _finish(worker, 1).success
+    dist.barrier()
+    kv[8:] = 0
+    torch.accelerator.synchronize()
+    dist.barrier()
+    worker.submit_load(2, names, _gpu_spec(list(range(8, 16))))
+    loaded = _finish(worker, 2).success
+    dist.barrier()  # every owner has written into every worker's KV cache
+    result_queue.put(
+        (
+            rank,
+            stored,
+            loaded,
+            set(worker._client.objects),
+            torch.equal(kv[8:], expected),
+        )
+    )
+    dist.barrier()
+    worker.shutdown()
+    dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 2, reason="needs 2 GPUs")
+def test_replicated_workers_share_out_the_chunks():
+    """With identical KV on every worker, each chunk is stored by its owner
+    alone, and a load writes every chunk into every worker's KV cache."""
+    import torch.multiprocessing as mp
+
+    from vllm.utils.network_utils import get_open_port
+
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    mp.spawn(_replicated_worker, args=(get_open_port(), result_queue), nprocs=2)
+    results = sorted(result_queue.get() for _ in range(2))
+
+    names = {f"chunk{i}" for i in range(4)}
+    assert all(stored and loaded for _, stored, loaded, _, _ in results)
+    assert results[0][3] | results[1][3] == names
+    assert not results[0][3] & results[1][3]
+    assert all(kv_equal for *_, kv_equal in results)
