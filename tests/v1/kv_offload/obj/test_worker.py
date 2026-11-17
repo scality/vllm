@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import patch
 
@@ -137,6 +138,28 @@ def test_remapped_pointers_keep_only_the_refs_kept():
 
     assert remapped.ptrs.tolist() == [6008, 6016, 1008, 1016]
     assert remapped.group_data_ref_counts == (2, 0)
+
+
+@pytest.mark.cpu_test
+def test_fast_load_finds_the_blocks_of_its_pointers():
+    """The fast load path takes block ids: they are found back from the
+    pointers of the first data ref, as resolve_device_pointers() made them."""
+    worker = SimpleNamespace(
+        _ref_tensors=[[1, 0]], _own_bases=[5000, 1000], _own_strides=[64, 32]
+    )
+    ptrs = DevicePointers(
+        ptrs=np.array(
+            [1000 + 7 * 32, 1000, 1000 + 5 * 32, 5448, 5000, 5320], dtype=np.uint64
+        ),
+        sizes=np.full(6, 8, dtype=np.uint64),
+        group_block_counts=(3,),
+        group_data_ref_counts=(2,),
+        block_indices=(0,),
+    )
+
+    block_ids = ObjOffloadingWorker._block_ids(worker, ptrs)  # type: ignore[arg-type]
+
+    assert block_ids.tolist() == [7, 0, 5]
 
 
 @pytest.mark.cpu_test
@@ -388,11 +411,11 @@ def _interleaving_mapping(rank: int) -> CanonicalPageMapping:
     )
 
 
-def _expected_object(chunk: int, canonical: bool) -> torch.Tensor:
-    """The object of chunk (blocks 2 * chunk and 2 * chunk + 1)."""
-    pages = [_sharded_kv(r)[2 * chunk : 2 * chunk + 2] for r in range(2)]
+def _expected_object(chunk: int, canonical: bool, bpc: int) -> torch.Tensor:
+    """The object of chunk (blocks bpc * chunk to bpc * (chunk + 1))."""
+    pages = [_sharded_kv(r)[bpc * chunk : bpc * (chunk + 1)] for r in range(2)]
     if canonical:
-        fragments = [p.view(BLOCKS_PER_CHUNK, 4, PAGE // 4) for p in pages]
+        fragments = [p.view(bpc, 4, PAGE // 4) for p in pages]
         body = torch.stack(fragments, dim=2).reshape(-1)
     else:
         body = torch.cat([p.reshape(-1) for p in pages])
@@ -401,7 +424,9 @@ def _expected_object(chunk: int, canonical: bool) -> torch.Tensor:
     return obj
 
 
-def _sharded_worker(rank: int, port: int, canonical: bool, result_queue) -> None:
+def _sharded_worker(
+    rank: int, port: int, canonical: bool, bpc: int, result_queue
+) -> None:
     import torch.distributed as dist
 
     torch.accelerator.set_device_index(rank)
@@ -423,9 +448,9 @@ def _sharded_worker(rank: int, port: int, canonical: bool, result_queue) -> None
     with patch("vllm.v1.kv_offload.obj.worker.ObjStoreClient", _FakeStore):
         worker = ObjOffloadingWorker(
             kv_caches=kv_caches,
-            blocks_per_chunk=BLOCKS_PER_CHUNK,
+            blocks_per_chunk=bpc,
             chunk_bytes=CHUNK_BYTES,
-            rank_page_bytes=0 if canonical else PAGE * BLOCKS_PER_CHUNK,
+            rank_page_bytes=0 if canonical else PAGE * bpc,
             canonical_layout=canonical,
             store_config={},
             io_threads=1,
@@ -436,7 +461,9 @@ def _sharded_worker(rank: int, port: int, canonical: bool, result_queue) -> None
             all_gather=all_gather,
         )
     worker._client.staging = worker._staging  # type: ignore[attr-defined]
-    names = ObjLoadStoreSpec([f"chunk{i}" for i in range(4)])
+    # One block per chunk takes the fast load path.
+    assert (worker._fast_loads is not None) == (bpc == 1)
+    names = ObjLoadStoreSpec([f"chunk{i}" for i in range(8 // bpc)])
     expected = kv[:8].clone()
 
     worker.submit_store(1, _ptrs(kv, list(range(8))), names)
@@ -458,7 +485,8 @@ def _sharded_worker(rank: int, port: int, canonical: bool, result_queue) -> None
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 2, reason="needs 2 GPUs")
 @pytest.mark.parametrize("canonical", [False, True])
-def test_sharded_chunks_are_gathered_and_scattered(canonical: bool):
+@pytest.mark.parametrize("bpc", [1, 2])
+def test_sharded_chunks_are_gathered_and_scattered(canonical: bool, bpc: int):
     """With KV sharded across workers, a chunk's owner gathers every worker's
     part into one object, laid out as the CPU tier lays it out, and a load
     gives every worker its part back."""
@@ -470,15 +498,49 @@ def test_sharded_chunks_are_gathered_and_scattered(canonical: bool):
     result_queue = ctx.Queue()
     mp.spawn(
         _sharded_worker,
-        args=(get_open_port(), canonical, result_queue),
+        args=(get_open_port(), canonical, bpc, result_queue),
         nprocs=2,
     )
     results = sorted(result_queue.get() for _ in range(2))
 
     assert all(stored and loaded for _, stored, loaded, _, _ in results)
     objects = {**results[0][3], **results[1][3]}
-    assert sorted(objects) == [f"chunk{i}" for i in range(4)]
-    for i in range(4):
-        expected = _expected_object(i, canonical).numpy().tobytes()
+    assert sorted(objects) == sorted(f"chunk{i}" for i in range(8 // bpc))
+    for i in range(8 // bpc):
+        expected = _expected_object(i, canonical, bpc).numpy().tobytes()
         assert objects[f"chunk{i}"] == expected
     assert all(kv_equal for *_, kv_equal in results)
+
+
+def test_one_block_chunks_take_the_fast_load_path(kv):
+    """Chunks of one GPU block are loaded through the vectorized fast path,
+    to the same bytes."""
+    kv_caches = CanonicalKVCaches(
+        tensors=[CanonicalKVCacheTensor(kv, PAGE)],
+        group_data_refs=[[CanonicalKVCacheRef(0, PAGE)]],
+    )
+    with patch("vllm.v1.kv_offload.obj.worker.ObjStoreClient", _FakeStore):
+        worker = ObjOffloadingWorker(
+            kv_caches=kv_caches,
+            blocks_per_chunk=1,
+            chunk_bytes=CHUNK_BYTES,
+            rank_page_bytes=0,
+            canonical_layout=False,
+            store_config={},
+            io_threads=1,
+            staging_bytes=2 * CHUNK_BYTES,
+            agent_name="test",
+        )
+    worker._client.staging = worker._staging  # type: ignore[attr-defined]
+    try:
+        assert worker._fast_loads is not None
+        names = ObjLoadStoreSpec([f"c{i}" for i in range(3)])
+        expected = kv[[1, 2, 3]].clone()
+        worker.submit_store(1, _ptrs(kv, [1, 2, 3]), names)
+        assert _finish(worker, 1).success
+        kv.zero_()
+        worker.submit_load(2, names, _ptrs(kv, [7, 0, 5]))
+        assert _finish(worker, 2).success
+        assert torch.equal(kv[[7, 0, 5]], expected)
+    finally:
+        worker.shutdown()
