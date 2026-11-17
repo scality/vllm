@@ -19,6 +19,7 @@ from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.kv_offload.obj.client import ObjStoreClient
 from vllm.v1.kv_offload.obj.common import ObjLoadStoreSpec
 from vllm.v1.kv_offload.obj.lookup import ObjAsyncLookupManager, ReuseNotifier
+from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
 logger = init_logger(__name__)
 
@@ -80,6 +81,12 @@ class ObjOffloadingManager(OffloadingManager):
         if result is None:
             return LookupResult.RETRY
         return LookupResult.HIT if result else LookupResult.MISS
+
+    def get_load_source(
+        self, key: OffloadKey, req_context: ReqContext
+    ) -> CacheHitSource:
+        # As the obj secondary tier reports its hits.
+        return CacheHitSource.DISK
 
     def requery_misses(
         self, keys: Collection[OffloadKey], req_context: ReqContext
