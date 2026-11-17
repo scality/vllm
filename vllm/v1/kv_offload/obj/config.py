@@ -72,7 +72,9 @@ class ObjStoreConfig:
         if not self.backend:
             raise ValueError("ObjStoreConfig requires a non-empty 'backend'")
         if self.backend == S3_BACKEND:
-            missing = [f for f in ("bucket", "endpoint_override") if not getattr(self, f)]
+            missing = [
+                f for f in ("bucket", "endpoint_override") if not getattr(self, f)
+            ]
             if missing:
                 raise ValueError(
                     f"Object store tier with backend {S3_BACKEND!r} requires: "

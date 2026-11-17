@@ -318,7 +318,8 @@ class SingleDirectionOffloadingHandler:
         """Initialize a SingleDirectionOffloadingHandler.
 
         Args:
-            cpu_tensors: list of CPU KV cache tensors.
+            cpu_tensors: list of offloaded KV cache tensors, in CPU memory or
+                in device memory (a staging buffer).
                 Each of shape (num_cpu_blocks, cpu_page_size_bytes) with dtype int8.
             blocks_per_chunk: number of GPU blocks per CPU chunk.
             layer_refs_per_group: list of CanonicalKVCacheRef per group.
@@ -336,7 +337,7 @@ class SingleDirectionOffloadingHandler:
         for cpu_tensor in cpu_tensors:
             assert cpu_tensor.dtype == torch.int8
             assert cpu_tensor.ndim == 2
-            assert cpu_tensor.device.type == "cpu"
+            assert cpu_tensor.device.type in ("cpu", current_platform.device_type)
 
         self.cpu_tensors = cpu_tensors
         self.gpu_to_cpu: bool = gpu_to_cpu

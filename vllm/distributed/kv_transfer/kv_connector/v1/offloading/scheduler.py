@@ -1934,7 +1934,7 @@ class OffloadingConnectorScheduler:
         self._jobs[job_id] = TransferJobStatus(
             req_id=req_id,
             pending_count=self.config.num_workers,
-            keys=set(keys),
+            keys=tuple(keys),
             is_store=False,
         )
 
@@ -2871,6 +2871,10 @@ class OffloadingConnectorScheduler:
                     )
                     req_status.load_failed = True
                 self.manager.complete_load(job_status.keys, req_status.req_context)
+                if job_status.failed:
+                    self.manager.mark_load_failed(
+                        job_status.keys, req_status.req_context
+                    )
                 if self._chunks_being_loaded:
                     self._chunks_being_loaded.difference_update(job_status.keys)
             if self._block_id_to_pending_jobs:

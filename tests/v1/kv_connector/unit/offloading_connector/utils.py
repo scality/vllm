@@ -94,6 +94,8 @@ class MockOffloadingWorker(OffloadingWorker):
         self._failing_jobs: set[int] = set()
         self.completed_jobs: list[int] = []
         self.flushed_jobs: set[int] = set()
+        # Jobs that complete as failed.
+        self.failed_jobs: set[int] = set()
 
     def get_finished(self) -> list[TransferResult]:
         finished = self.completed_transfers
@@ -146,10 +148,8 @@ class MockOffloadingSpec(OffloadingSpec):
 
         self.manager = MagicMock(spec=OffloadingManager)
         # Look keys up one by one, so tests can script lookup() alone.
-        self.manager.lookup_prefix.side_effect = (
-            lambda keys, req_context: OffloadingManager.lookup_prefix(
-                self.manager, keys, req_context
-            )
+        self.manager.lookup_prefix.side_effect = lambda keys, req_context: (
+            OffloadingManager.lookup_prefix(self.manager, keys, req_context)
         )
         self.manager.prepare_load = lambda keys, req_context: MockLoadStoreSpec(keys)
         self.manager.lookup.return_value = LookupResult.MISS
@@ -578,8 +578,6 @@ class RequestRunner:
             transfer_results = self.worker_connector.get_transfer_results(
                 scheduler_output.finished_req_ids
             )
-            finished_sending = transfer_results.finished_sending
-            finished_recving = transfer_results.finished_recving
             worker_meta = (
                 self.worker_connector.build_connector_worker_meta()
                 or OffloadingWorkerMetadata()

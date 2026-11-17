@@ -99,3 +99,47 @@ def resolve_device_pointers(
         group_data_ref_counts=tuple(len(refs) for refs in group_data_refs),
         block_indices=tuple(block_indices),
     )
+
+
+def slice_device_pointers(
+    device_ptrs: DevicePointers, blocks_per_chunk: int, start: int, end: int
+) -> DevicePointers:
+    """The pointers of chunks [start, end) of a transfer, chunks being numbered
+    group by group as iter_pointer_groups() numbers them."""
+    ptrs: list[np.ndarray] = []
+    sizes: list[np.ndarray] = []
+    group_block_counts: list[int] = []
+    block_indices: list[int] = []
+    chunk_offset = 0
+    dev_ptr_offset = 0
+    for group_size, n_data_refs, block_idx in zip(
+        device_ptrs.group_block_counts,
+        device_ptrs.group_data_ref_counts,
+        device_ptrs.block_indices,
+    ):
+        skip = block_idx % blocks_per_chunk
+        n_chunks = cdiv(group_size + skip, blocks_per_chunk) if group_size else 0
+        first = max(start - chunk_offset, 0)
+        last = min(end - chunk_offset, n_chunks)
+        if first < last:
+            lo = max(first * blocks_per_chunk - skip, 0)
+            hi = min(last * blocks_per_chunk - skip, group_size)
+            for d in range(n_data_refs):
+                ref_offset = dev_ptr_offset + d * group_size
+                ptrs.append(device_ptrs.ptrs[ref_offset + lo : ref_offset + hi])
+                sizes.append(device_ptrs.sizes[ref_offset + lo : ref_offset + hi])
+            group_block_counts.append(hi - lo)
+            block_indices.append(block_idx + lo)
+        else:
+            group_block_counts.append(0)
+            block_indices.append(block_idx)
+        chunk_offset += n_chunks
+        dev_ptr_offset += group_size * n_data_refs
+    empty = np.empty(0, dtype=np.uint64)
+    return DevicePointers(
+        ptrs=np.concatenate(ptrs) if ptrs else empty,
+        sizes=np.concatenate(sizes) if sizes else empty,
+        group_block_counts=tuple(group_block_counts),
+        group_data_ref_counts=device_ptrs.group_data_ref_counts,
+        block_indices=tuple(block_indices),
+    )

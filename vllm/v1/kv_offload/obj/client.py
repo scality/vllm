@@ -172,9 +172,7 @@ class ObjStoreClient:
         for descriptor in build_registration_descriptors(
             base_addr, num_slots, slot_bytes, dev_id
         ):
-            self._local_regs.append(
-                self._agent.register_memory([descriptor], mem_type)
-            )
+            self._local_regs.append(self._agent.register_memory([descriptor], mem_type))
 
         slots = [
             (base_addr + i * slot_bytes, slot_bytes, dev_id) for i in range(num_slots)
