@@ -5015,13 +5015,15 @@ class TestMambaHybridOffloadServing:
 class _PromotionScript:
     """Answer every lookup with a chunk being promoted, and complete the
     promotions as scripted: each take_promotion_results() call promotes, then
-    fails, the given numbers of the next pending chunks, in chunk order."""
+    fails, the given numbers of the next pending chunks, in chunk order. A
+    failed chunk is a miss from then on, as the tiering manager marks it."""
 
     def __init__(self, manager: MagicMock, outcomes: list[tuple[int, int]]):
         self.outcomes = list(outcomes)
         self.keys: list[OffloadKey] = []
         self.promoting: set[OffloadKey] = set()
         self.promoted: set[OffloadKey] = set()
+        self.failed: set[OffloadKey] = set()
         manager.lookup.side_effect = self.lookup
         manager.is_promotion_pending.side_effect = lambda key: key in self.promoting
         manager.reserve_load.side_effect = self.reserve_load
@@ -5030,6 +5032,8 @@ class _PromotionScript:
     def lookup(self, key, req_context):
         if key in self.promoted:
             return LookupResult.HIT
+        if key in self.failed:
+            return LookupResult.MISS
         self.promoting.add(key)
         return LookupResult.HIT_PENDING
 
@@ -5046,6 +5050,7 @@ class _PromotionScript:
         failed = pending[num_promoted : num_promoted + num_failed]
         self.promoting.difference_update(promoted + failed)
         self.promoted.update(promoted)
+        self.failed.update(failed)
         return promoted, failed
 
 
@@ -5099,18 +5104,24 @@ def test_failed_promotion_recomputes_the_request(
     request_runner, async_scheduling: bool
 ):
     """A failed promotion releases the chunks still pending, and the request
-    recomputes after the pieces already issued are done."""
+    recomputes after the pieces already issued are done: its retry loads the
+    chunk that was promoted and not the one that failed."""
     runner = _store_three_chunks(request_runner, async_scheduling)
     script = _PromotionScript(runner.manager, [(1, 0), (0, 1)])
+    # The scheduler clears the set it passes once the call returns.
+    cancelled: list[set[OffloadKey]] = []
+    runner.manager.cancel_reserved_load.side_effect = (
+        lambda keys, req_context: cancelled.append(set(keys))
+    )
 
     runner.new_request(token_ids=[0] * 12 + [1])
     runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(0,))
 
-    assert [src.offload_keys for src in _load_jobs(runner)] == [script.keys[:1]]
-    runner.manager.cancel_reserved_load.assert_called_once()
-    assert set(runner.manager.cancel_reserved_load.call_args.args[0]) == {
-        script.keys[2]
-    }
+    assert [src.offload_keys for src in _load_jobs(runner)] == [
+        script.keys[:1],
+        script.keys[:1],
+    ]
+    assert cancelled == [{script.keys[2]}]
     assert not runner.connector_scheduler._streaming_loads
 
 
@@ -5193,17 +5204,12 @@ def test_failed_store_completes_unsuccessfully(request_runner, async_scheduling:
         assert store_call.kwargs["success"] is False
 
 
-@pytest.mark.skip(
-    reason="hangs in RequestRunner after the recompute, like "
-    "test_failed_promotion_recomputes_the_request"
-)
 @pytest.mark.parametrize("async_scheduling", [True, False])
 def test_failed_load_marks_its_chunks_failed(request_runner, async_scheduling: bool):
     """A load a worker failed is reported to the manager with its keys, and
     the request is recomputed."""
     runner = _store_three_chunks(request_runner, async_scheduling)
     runner.offloading_spec.handler.failed_jobs = set(range(100))
-    runner.manager.take_promotion_results.return_value = ((), ())
 
     runner.new_request(token_ids=[0] * 12 + [1])
     runner.manager.lookup.side_effect = [LookupResult.HIT] * 3 + [
