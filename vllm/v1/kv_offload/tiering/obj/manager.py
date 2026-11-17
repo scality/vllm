@@ -6,12 +6,8 @@ import ctypes
 import threading
 import time
 from collections.abc import Collection, Iterable
-from typing import TYPE_CHECKING, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, ClassVar
 
-import numpy as np
-
-from vllm.distributed.nixl_utils import NixlWrapper as nixl_agent
-from vllm.distributed.nixl_utils import nixl_agent_config
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     Locality,
@@ -22,6 +18,7 @@ from vllm.v1.kv_offload.base import (
     ReqContext,
 )
 from vllm.v1.kv_offload.file_mapper import FileMapper
+from vllm.v1.kv_offload.obj.client import NIXL_READ, NIXL_WRITE, ObjStoreClient
 from vllm.v1.kv_offload.tiering.async_lookup import AsyncLookupManager
 from vllm.v1.kv_offload.tiering.backpressure import BackpressureDetector
 from vllm.v1.kv_offload.tiering.base import (
@@ -32,65 +29,13 @@ from vllm.v1.kv_offload.tiering.base import (
     SecondaryTierManager,
     TransferJob,
 )
-from vllm.v1.kv_offload.tiering.obj.config import S3_BACKEND, ObjStoreConfig
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from nixl._api import nixl_prepped_dlist_handle, nixl_xfer_handle
-
     from vllm.v1.kv_offload.base import OffloadingSpec
 
 logger = init_logger(__name__)
-
-NIXL_WRITE = "WRITE"
-NIXL_READ = "READ"
-NIXL_PROC = "PROC"
-NIXL_DONE = "DONE"
-
-# Device ID for CPU DRAM descriptors. DRAM is not a multi-device resource so
-# the device ID is always 0.
-NIXL_DEV_ID: int = 0
-
-# Fields for NIXL OBJ descriptors: (addr, len, dev_id, obj_key).
-# For existence probes addr and len are placeholders — no data is read.
-# dev_id=0 is reserved for probes; transfers start from 1.
-_PROBE_ADDR: int = 0
-_PROBE_LEN: int = 1
-_PROBE_DEV_ID: int = 0
-_CUOBJ_MAX_MEMORY_REG_SIZE_BYTES = 4 * 1024 * 1024 * 1024 - 64 * 1024
-
-
-class TransferEntry(NamedTuple):
-    xfer_handle: "nixl_xfer_handle"
-    files_desc: object
-    obj_handle: "nixl_prepped_dlist_handle"
-
-
-def _build_primary_dram_descriptors(
-    base_addr: int,
-    num_blocks: int,
-    stride: int,
-    max_registration_bytes: int = _CUOBJ_MAX_MEMORY_REG_SIZE_BYTES,
-) -> list[tuple[int, int, int, str]]:
-    if stride > max_registration_bytes:
-        raise ValueError(
-            "Object store RDMA cannot register a primary-tier block larger "
-            f"than {max_registration_bytes} bytes: block size is {stride} bytes"
-        )
-    blocks_per_registration = max_registration_bytes // stride
-    descriptors = []
-    for start_block in range(0, num_blocks, blocks_per_registration):
-        block_count = min(blocks_per_registration, num_blocks - start_block)
-        descriptors.append(
-            (
-                base_addr + start_block * stride,
-                block_count * stride,
-                NIXL_DEV_ID,
-                "",
-            )
-        )
-    return descriptors
 
 
 class ObjAsyncLookupManager(AsyncLookupManager):
@@ -111,8 +56,7 @@ class ObjAsyncLookupManager(AsyncLookupManager):
     def batch_lookup(
         self, keys: list[OffloadKey], req_context: ReqContext
     ) -> Iterable[bool]:
-        results = self._tier._query_existence(keys)
-        return (r is not None for r in results)
+        return self._tier._query_existence(keys)
 
 
 class _ReuseNotifier:
@@ -274,25 +218,6 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         # mark its own cached lookup verdicts False (see get_finished_jobs).
         self._load_job_keys: dict[JobId, list[OffloadKey]] = {}
 
-        agent_config = nixl_agent_config(backends=[], capture_telemetry=True)
-        self._agent = nixl_agent("ObjAgent", agent_config)
-        obj_config = ObjStoreConfig(**store_config)
-        self._backend = obj_config.backend
-        if "OBJ_SEG" not in self._agent.get_plugin_mem_types(self._backend):
-            raise ValueError(
-                f"NIXL backend {self._backend!r} is not available or does not "
-                f"support object segments (OBJ_SEG). Available plugins: "
-                f"{', '.join(self._agent.get_plugin_list())}."
-            )
-        params = {**obj_config.to_nixl_params(), "num_threads": str(io_threads)}
-        self._agent.create_backend(self._backend, params)
-        self._transfers: dict[int, TransferEntry] = {}
-        # Buffered results awaiting the next get_finished_jobs() call:
-        # submission-time failures + poll-time completions accumulated
-        # during drain_jobs().
-        self._pending_results: list[JobResult] = []
-        self._primary_reg = None
-        self._block_size_bytes: int = 0
         root_dir = f"{prefix}/" if prefix else ""
         # Opt in; FileMapper enables it only for a parallelism-invariant block.
         self._file_mapper = FileMapper.from_offloading_spec(
@@ -301,28 +226,17 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
             blocks_per_file=offloading_spec.blocks_per_chunk,
             parallel_agnostic=True,
         )
-        self._next_obj_dev_id: int = 1  # dev_id=0 is reserved for _exists() probes
 
-        self._probe_connectivity()
-
-        base_addr = ctypes.addressof(ctypes.c_char.from_buffer(primary_kv_view))
-        assert primary_kv_view.strides is not None
-        stride = primary_kv_view.strides[0]
-        dram_descriptors = _build_primary_dram_descriptors(
-            base_addr, len(primary_kv_view), stride
-        )
-        self._primary_reg = self._agent.register_memory(dram_descriptors, "DRAM")
-        self._block_size_bytes = stride
-        all_blocks = [
-            (base_addr + i * stride, stride, NIXL_DEV_ID)
-            for i in range(len(primary_kv_view))
-        ]
-        # NIXL_INIT_AGENT marks this as the local side; make_prepped_xfer requires
-        # local_xfer_side tagged with NIXL_INIT_AGENT and remote_xfer_side tagged
-        # with the peer agent name ("ObjAgent").
-        self._dram_prepped_handle: nixl_prepped_dlist_handle = (
-            self._agent.prep_xfer_dlist("NIXL_INIT_AGENT", all_blocks, "DRAM")
-        )
+        self._client = ObjStoreClient("ObjAgent", store_config, io_threads)
+        try:
+            self._client.register_local(
+                base_addr=ctypes.addressof(ctypes.c_char.from_buffer(primary_kv_view)),
+                num_slots=len(primary_kv_view),
+                slot_bytes=self.block_size_bytes,
+            )
+        except Exception:
+            self._client.shutdown()
+            raise
 
         self._lookup_manager = ObjAsyncLookupManager(
             tier=self, tier_type=self.tier_type
@@ -337,109 +251,10 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
                 max_keys=int(reuse_notify.get("max_keys", 10000)),
             )
 
-    def _query_existence(self, keys: Iterable[OffloadKey]) -> list:
-        """One NIXL existence query for ``keys``; ``None`` marks a missing key."""
-        descriptors = [
-            (
-                _PROBE_ADDR,
-                _PROBE_LEN,
-                _PROBE_DEV_ID,
-                self._file_mapper.get_file_name(k),
-            )
-            for k in keys
-        ]
-        return self._agent.query_memory(descriptors, self._backend, "OBJ")
-
-    def _probe_connectivity(self) -> None:
-        """Verify object store connectivity at startup via a NIXL lookup probe.
-
-        Performs a single exists() check against a synthetic key that will
-        never exist. A True/False result confirms the bucket is reachable;
-        an exception indicates misconfigured obj store params and raises RuntimeError.
-        """
-        probe_key = "__nixl_probe__/connectivity_test"
-        if self._backend != S3_BACKEND:
-            hint = f"endpoint_override and backend_params of backend {self._backend}"
-        else:
-            hint = (
-                "bucket, endpoint_override, and scheme. If using explicit "
-                "credentials verify access_key and secret_key; otherwise ensure "
-                "the AWS SDK default credential chain is configured (IAM role, "
-                "env vars, credential file)"
-            )
-        try:
-            self._exists(probe_key)
-            logger.info("Object store tier connectivity probe succeeded")
-        except Exception as e:
-            raise RuntimeError(
-                f"Object store tier connectivity probe failed — check {hint}. "
-                f"Error: {e}"
-            ) from e
-
-    def _exists(self, obj_key: str) -> bool:
-        results = self._agent.query_memory(
-            [(_PROBE_ADDR, _PROBE_LEN, _PROBE_DEV_ID, obj_key)], self._backend, "OBJ"
-        )
-        return results[0] is not None
-
-    def _submit_transfer(
-        self,
-        job_id: int,
-        block_ids: np.ndarray,
-        obj_keys: Iterable[str],
-        op: str,
-    ) -> None:
-        """Submit an async transfer. op is 'WRITE' (store) or 'READ' (load)."""
-        # NIXL takes indices as int32; a wider dtype silently costs a conversion.
-        assert block_ids.dtype == np.int32
-        # The OBJ backend maps devId -> obj_key. All descriptors must have
-        # unique devIds or later registrations overwrite earlier ones.
-        nixl_files = [
-            (0, self._block_size_bytes, dev_id, key)
-            for dev_id, key in enumerate(obj_keys, self._next_obj_dev_id)
-        ]
-        self._next_obj_dev_id += len(nixl_files)
-
-        files_desc = self._agent.register_memory(nixl_files, "OBJ")
-        if files_desc is None:
-            logger.warning("register_memory (OBJ) failed for job %d", job_id)
-            self._pending_results.append(JobResult(job_id=job_id, success=False))
-            return
-
-        obj_handle = self._agent.prep_xfer_dlist("ObjAgent", files_desc.trim())
-        if not obj_handle:
-            logger.warning("prep_xfer_dlist (OBJ) failed for job %d", job_id)
-            self._agent.deregister_memory(files_desc)
-            self._pending_results.append(JobResult(job_id=job_id, success=False))
-            return
-
-        xfer_handle = self._agent.make_prepped_xfer(
-            op,
-            self._dram_prepped_handle,
-            block_ids,
-            obj_handle,
-            np.arange(len(nixl_files), dtype=np.int32),
-        )
-        if not xfer_handle:
-            logger.warning("make_prepped_xfer failed for job %d", job_id)
-            self._agent.release_dlist_handle(obj_handle)
-            self._agent.deregister_memory(files_desc)
-            self._pending_results.append(JobResult(job_id=job_id, success=False))
-            return
-
-        state = self._agent.transfer(xfer_handle)
-        if state == "ERR":
-            logger.warning("agent.transfer failed for job %d", job_id)
-            self._agent.release_dlist_handle(obj_handle)
-            self._agent.deregister_memory(files_desc)
-            self._agent.release_xfer_handle(xfer_handle)
-            self._pending_results.append(JobResult(job_id=job_id, success=False))
-            return
-
-        self._transfers[job_id] = TransferEntry(
-            xfer_handle=xfer_handle,
-            files_desc=files_desc,
-            obj_handle=obj_handle,
+    def _query_existence(self, keys: Iterable[OffloadKey]) -> list[bool]:
+        """One existence query for ``keys``."""
+        return self._client.query_existence(
+            self._file_mapper.get_file_name(k) for k in keys
         )
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
@@ -451,7 +266,7 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
     def submit_store(self, job_metadata: TransferJob) -> None:
         self._store_jobs[job_metadata.job_id] = job_metadata
         obj_keys = (self._file_mapper.get_file_name(k) for k in job_metadata.keys)
-        self._submit_transfer(
+        self._client.submit(
             job_metadata.job_id, job_metadata.chunk_ids, obj_keys, NIXL_WRITE
         )
 
@@ -460,7 +275,7 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         if self._reuse_notifier is not None:
             self._reuse_notifier.note_loaded(job_metadata.keys)
         obj_keys = (self._file_mapper.get_file_name(k) for k in job_metadata.keys)
-        self._submit_transfer(
+        self._client.submit(
             job_metadata.job_id, job_metadata.chunk_ids, obj_keys, NIXL_READ
         )
 
@@ -484,77 +299,13 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()
 
-    def _poll_active_transfers(self) -> None:
-        """Poll all in-flight transfers once; move newly-completed (success or
-        failure) into ``_pending_results`` and release their NIXL handles."""
-        for job_id, entry in list(self._transfers.items()):
-            try:
-                state = self._agent.check_xfer_state(entry.xfer_handle)
-            except Exception as exc:
-                success = False
-                logger.warning("check_xfer_state raised for job %d: %s", job_id, exc)
-            else:
-                if state == NIXL_PROC:
-                    continue
-                if state == NIXL_DONE:
-                    success = True
-                else:
-                    success = False
-                    logger.warning("transfer failed job=%d state=%s", job_id, state)
-
-            transfer_time = None
-            if success:
-                # Telemetry is optional: some NIXL builds are compiled without
-                # it and raise here. A metrics failure must not fail a transfer
-                # that already completed.
-                try:
-                    telemetry = self._agent.get_xfer_telemetry(entry.xfer_handle)
-                except Exception:
-                    logger.warning_once(
-                        "NIXL transfer telemetry is unavailable; offload "
-                        "transfer timings will be omitted."
-                    )
-                else:
-                    transfer_time = telemetry.xferDuration / 1e6
-
-            try:
-                self._agent.release_xfer_handle(entry.xfer_handle)
-            except Exception as exc:
-                # Keep the entry until NIXL confirms that the transfer handle
-                # can be released. The transfer may still access primary-tier
-                # memory, so publishing its result would allow unsafe reuse.
-                logger.warning("release_xfer_handle failed for job %d: %s", job_id, exc)
-                continue
-
-            # Once the transfer handle is released, these remaining cleanup
-            # failures must not suppress the job completion. They can leak
-            # NIXL metadata, but cannot leave an active data transfer behind.
-            try:
-                self._agent.release_dlist_handle(entry.obj_handle)
-            except Exception as exc:
-                logger.warning(
-                    "release_dlist_handle failed for job %d: %s", job_id, exc
-                )
-            try:
-                self._agent.deregister_memory(entry.files_desc)
-            except Exception as exc:
-                logger.warning("deregister_memory failed for job %d: %s", job_id, exc)
-
-            del self._transfers[job_id]
-            self._pending_results.append(
-                JobResult(
-                    job_id=job_id,
-                    success=success,
-                    transfer_time=transfer_time,
-                )
-            )
-
     def get_finished_jobs(self) -> Iterable[JobResult]:
         """Poll transfers; a failed promotion marks its cached verdicts False
         here (scheduler thread)."""
-        self._poll_active_transfers()
-        results = self._pending_results
-        self._pending_results = []
+        results = [
+            JobResult(job_id=r.job_id, success=r.success, transfer_time=r.transfer_time)
+            for r in self._client.poll()
+        ]
         for result in results:
             job = self._store_jobs.pop(result.job_id, None)
             if result.success and job is not None:
@@ -588,58 +339,12 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
             self.events.clear()
 
     def drain_jobs(self) -> None:
-        """Block until every submitted transfer has completed or failed.
-
-        nixl exposes only ``check_xfer_state`` (poll-based), so this loops
-        until ``_transfers`` is empty. Results accumulate in
-        ``_pending_results`` and are surfaced by the next
-        ``get_finished_jobs()`` call.
-        """
-        start = time.monotonic()
-        warned = False
-        while self._transfers:
-            self._poll_active_transfers()
-            if not self._transfers:
-                break
-            if not warned and time.monotonic() - start > 5.0:
-                logger.warning(
-                    "ObjectStoreSecondaryTierManager.drain_jobs: still "
-                    "draining after 5s (%d transfers in flight); a stuck "
-                    "transfer will block the engine.",
-                    len(self._transfers),
-                )
-                warned = True
-            time.sleep(0.001)
+        """Block until every submitted transfer has completed or failed; their
+        results are surfaced by the next ``get_finished_jobs()`` call."""
+        self._client.drain()
 
     def shutdown(self) -> None:
         if self._reuse_notifier is not None:
             self._reuse_notifier.stop()
         self._lookup_manager.shutdown()
-        for job_id, entry in self._transfers.items():
-            try:
-                self._agent.release_xfer_handle(entry.xfer_handle)
-            except Exception as exc:
-                logger.warning("release_xfer_handle failed for job %d: %s", job_id, exc)
-            try:
-                self._agent.release_dlist_handle(entry.obj_handle)
-            except Exception as exc:
-                logger.warning(
-                    "release_dlist_handle failed for job %d: %s", job_id, exc
-                )
-            try:
-                self._agent.deregister_memory(entry.files_desc)
-            except Exception as exc:
-                logger.warning("deregister_memory failed for job %d: %s", job_id, exc)
-        self._transfers.clear()
-        if self._dram_prepped_handle is not None:
-            try:
-                self._agent.release_dlist_handle(self._dram_prepped_handle)
-            except Exception as exc:
-                logger.warning("failed to release DRAM prepped handle: %s", exc)
-            self._dram_prepped_handle = None
-        if self._primary_reg is not None:
-            try:
-                self._agent.deregister_memory(self._primary_reg)
-            except Exception as exc:
-                logger.warning("failed to deregister primary buffer: %s", exc)
-            self._primary_reg = None
+        self._client.shutdown()

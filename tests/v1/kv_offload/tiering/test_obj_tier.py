@@ -38,12 +38,13 @@ from vllm.v1.kv_offload.tiering.manager import (
     CPUPrimaryTierOffloadingManager,
     TieringOffloadingManager,
 )
-from vllm.v1.kv_offload.tiering.obj.config import ObjStoreConfig
-from vllm.v1.kv_offload.tiering.obj.manager import (
-    _CUOBJ_MAX_MEMORY_REG_SIZE_BYTES,
-    ObjectStoreSecondaryTierManager,
-    _build_primary_dram_descriptors,
+from vllm.v1.kv_offload.obj.client import (
+    MAX_REG_BYTES,
+    ObjStoreClient,
+    build_registration_descriptors,
 )
+from vllm.v1.kv_offload.obj.config import ObjStoreConfig
+from vllm.v1.kv_offload.tiering.obj.manager import ObjectStoreSecondaryTierManager
 
 # ---------------------------------------------------------------------------
 # Shared stubs
@@ -263,13 +264,13 @@ def _make_tier(
         primary_kv_view = memoryview(tensor.numpy())
     with (
         patch(
-            "vllm.v1.kv_offload.tiering.obj.manager.nixl_agent_config",
+            "vllm.v1.kv_offload.obj.client.nixl_agent_config",
             side_effect=lambda backends, capture_telemetry=False: SimpleNamespace(
                 capture_telemetry=capture_telemetry
             ),
         ),
         patch(
-            "vllm.v1.kv_offload.tiering.obj.manager.nixl_agent",
+            "vllm.v1.kv_offload.obj.client.nixl_agent",
             side_effect=MockNixlAgent,
         ),
     ):
@@ -281,7 +282,7 @@ def _make_tier(
             prefix=_RUN_PREFIX,
             **tier_kwargs,
         )
-    return tier, tier._agent
+    return tier, tier._client._agent
 
 
 def drain(
@@ -291,7 +292,7 @@ def drain(
     results: list[JobResult] = []
     for _ in range(max_rounds):
         results.extend(tier.get_finished_jobs())
-        if not tier._transfers:
+        if not tier._client._transfers:
             break
     return results
 
@@ -375,7 +376,7 @@ class TestMockObjTierBasic:
         self.tier.submit_load(make_job(2, [key(1), key(2)], [0, 1]))
         results = drain(self.tier)
         assert results == [JobResult(job_id=2, success=True, transfer_time=0.001)]
-        assert not self.tier._transfers
+        assert not self.tier._client._transfers
         assert list(self.tier.get_finished_jobs()) == []
 
     def test_multiple_jobs_tracked_independently(self):
@@ -451,11 +452,11 @@ class TestMockObjTierBasic:
         self.agent.check_xfer_state = delayed
 
         self.tier.submit_store(make_job(1, [key(1)], [0]))
-        assert self.tier._transfers  # in flight
+        assert self.tier._client._transfers  # in flight
 
         self.tier.drain_jobs()
 
-        assert not self.tier._transfers  # fully drained
+        assert not self.tier._client._transfers  # fully drained
         assert call_count[0] >= 3  # polled past the initial PROC responses
         # Result is buffered for the next get_finished_jobs() call.
         results = list(self.tier.get_finished_jobs())
@@ -491,6 +492,41 @@ class TestMockObjTierFailures:
             RuntimeError("backend error")
         )
         assert lookup_and_wait(tier, [key(1)]) == [LookupResult.MISS]
+
+    @pytest.mark.parametrize(
+        "method", ["register_memory", "prep_xfer_dlist", "make_prepped_xfer"]
+    )
+    def test_raising_submission_is_reported_failed(self, method):
+        """NIXL >= 1.1 raises instead of returning None; the job must still be
+        reported, not escape into the engine step."""
+        tier, agent = _make_tier(num_blocks=4)
+        original = getattr(agent, method)
+
+        def fail_on_obj(*args, **kwargs):
+            if method == "register_memory" and args[1] != "OBJ":
+                return original(*args, **kwargs)
+            raise RuntimeError("NIXL_ERR_BACKEND")
+
+        setattr(agent, method, fail_on_obj)
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        results = list(tier.get_finished_jobs())
+        assert [(r.job_id, r.success) for r in results] == [(1, False)]
+        assert not tier._client._transfers
+
+    def test_unreleasable_failed_submission_is_retried_by_poll(self, monkeypatch):
+        """A failed post whose transfer handle cannot be released yet is held
+        until it can, then reported failed."""
+        tier, agent = _make_tier(num_blocks=4)
+        monkeypatch.setattr(agent, "transfer", lambda handle: "ERR")
+        release = MagicMock(side_effect=[RuntimeError("busy"), None])
+        monkeypatch.setattr(agent, "release_xfer_handle", release)
+
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        assert 1 in tier._client._transfers
+        results = list(tier.get_finished_jobs())
+        assert [(r.job_id, r.success) for r in results] == [(1, False)]
+        assert release.call_count == 2
+        assert not tier._client._transfers
 
     def test_submit_store_register_memory_failure_reported_in_get_finished(self):
         tier, agent = _make_tier(num_blocks=4)
@@ -552,7 +588,7 @@ class TestMockObjTierFailures:
         # The transfer handle could not be released safely, so the job must
         # remain tracked and must not be finalized yet.
         assert list(tier.get_finished_jobs()) == []
-        assert 1 in tier._transfers
+        assert 1 in tier._client._transfers
 
         # Cleanup is retried without polling again or changing the failure
         # verdict. The completion is then returned exactly once.
@@ -562,7 +598,7 @@ class TestMockObjTierFailures:
         assert not results[0].success
         assert agent.check_xfer_state.call_count == 2
         assert release_xfer.call_count == 2
-        assert not tier._transfers
+        assert not tier._client._transfers
         assert list(tier.get_finished_jobs()) == []
 
     @pytest.mark.parametrize(
@@ -584,7 +620,7 @@ class TestMockObjTierFailures:
         assert len(results) == 1
         assert results[0].job_id == 1
         assert results[0].success
-        assert not tier._transfers
+        assert not tier._client._transfers
         assert list(tier.get_finished_jobs()) == []
 
     def test_telemetry_failure_does_not_lose_successful_transfer(self, monkeypatch):
@@ -604,7 +640,7 @@ class TestMockObjTierFailures:
         assert results[0].success
         # Only the timing is lost.
         assert results[0].transfer_time is None
-        assert not tier._transfers
+        assert not tier._client._transfers
         assert list(tier.get_finished_jobs()) == []
 
     def test_xfer_cleanup_retry_finalizes_parent_job_and_primary_pin(self, monkeypatch):
@@ -646,14 +682,14 @@ class TestMockObjTierFailures:
 
         assert len(manager._transfer_jobs) == 1
         assert block.ref_cnt == 1
-        assert len(obj_tier._transfers) == 1
+        assert len(obj_tier._client._transfers) == 1
         assert manager.has_pending_work()
 
         manager.on_schedule_end(schedule_context)
 
         assert manager._transfer_jobs == {}
         assert block.ref_cnt == 0
-        assert obj_tier._transfers == {}
+        assert obj_tier._client._transfers == {}
         assert not manager.has_pending_work()
         assert agent.check_xfer_state.call_count == 2
         assert release_xfer.call_count == 2
@@ -665,11 +701,11 @@ class TestMockObjTierShutdown:
         # Keep transfer in flight by never completing it
         agent.check_xfer_state = lambda h: "PROC"
         tier.submit_store(make_job(1, [key(1)], [0]))
-        assert len(tier._transfers) == 1
+        assert len(tier._client._transfers) == 1
         tier.shutdown()
-        assert len(tier._transfers) == 0
-        assert tier._dram_prepped_handle is None
-        assert tier._primary_reg is None
+        assert len(tier._client._transfers) == 0
+        assert tier._client._local_handle is None
+        assert tier._client._local_regs == []
 
     def test_shutdown_idempotent(self):
         tier, _ = _make_tier(num_blocks=4)
@@ -928,9 +964,9 @@ def test_obj_tier_passes_accelerated_params_to_nixl_backend():
 def test_primary_dram_registration_uses_single_range_below_cuobj_limit():
     stride = 1024
     base_addr = 0x100000
-    num_blocks = _CUOBJ_MAX_MEMORY_REG_SIZE_BYTES // stride
+    num_blocks = MAX_REG_BYTES // stride
 
-    descriptors = _build_primary_dram_descriptors(base_addr, num_blocks, stride)
+    descriptors = build_registration_descriptors(base_addr, num_blocks, stride)
 
     assert descriptors == [
         (
@@ -945,10 +981,10 @@ def test_primary_dram_registration_uses_single_range_below_cuobj_limit():
 def test_primary_dram_registration_splits_ranges_above_cuobj_limit():
     stride = 1024
     base_addr = 0x100000
-    blocks_per_registration = _CUOBJ_MAX_MEMORY_REG_SIZE_BYTES // stride
+    blocks_per_registration = MAX_REG_BYTES // stride
     num_blocks = blocks_per_registration + 7
 
-    descriptors = _build_primary_dram_descriptors(base_addr, num_blocks, stride)
+    descriptors = build_registration_descriptors(base_addr, num_blocks, stride)
 
     assert descriptors == [
         (
@@ -968,10 +1004,10 @@ def test_primary_dram_registration_splits_ranges_above_cuobj_limit():
 
 def test_primary_dram_registration_rejects_oversized_block():
     with pytest.raises(ValueError, match="block larger"):
-        _build_primary_dram_descriptors(
+        build_registration_descriptors(
             base_addr=0x100000,
-            num_blocks=1,
-            stride=_CUOBJ_MAX_MEMORY_REG_SIZE_BYTES + 1,
+            num_slots=1,
+            slot_bytes=MAX_REG_BYTES + 1,
         )
 
 
@@ -1079,3 +1115,35 @@ def test_rest_tier_uses_rest_backend():
 def test_backend_without_obj_segments_raises(backend):
     with pytest.raises(ValueError, match="object segments"):
         _make_tier(store_config={"backend": backend})
+
+
+def test_gpu_memory_registered_with_its_device():
+    """GPU slots carry the GPU ordinal, which the REST plugin uses to pick the
+    NICs close to that GPU."""
+    with (
+        patch("vllm.v1.kv_offload.obj.client.nixl_agent_config"),
+        patch(
+            "vllm.v1.kv_offload.obj.client.nixl_agent",
+            side_effect=MockNixlAgent,
+        ),
+    ):
+        client = ObjStoreClient("gpu", _REST_STORE_CONFIG, io_threads=1)
+    agent = client._agent
+    slot_bytes = 1024
+    with (
+        patch.object(agent, "register_memory", wraps=agent.register_memory) as reg,
+        patch.object(agent, "prep_xfer_dlist") as prep,
+    ):
+        client.register_local(
+            base_addr=0x1000,
+            num_slots=3,
+            slot_bytes=slot_bytes,
+            mem_type="VRAM",
+            dev_id=5,
+        )
+    reg.assert_called_once_with([(0x1000, 3 * slot_bytes, 5, "")], "VRAM")
+    prep.assert_called_once_with(
+        "NIXL_INIT_AGENT",
+        [(0x1000 + i * slot_bytes, slot_bytes, 5) for i in range(3)],
+        "VRAM",
+    )
