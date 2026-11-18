@@ -18,7 +18,7 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.config import OffloadingConfig
 from vllm.v1.kv_offload.cpu.common import CPUOffloadingInfo, CPUOffloadingMetrics
-from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker, FanOut
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import (
     REGION_SEGMENTS,
@@ -154,6 +154,17 @@ class CPUOffloadingSpec(OffloadingSpec):
                 "cpu_to_gpu_copy must be 'auto' or 'triton', got "
                 f"{self.cpu_to_gpu_copy!r}"
             )
+        # A GPU staging buffer for loads from the CPU tier (see _StagedLoads in
+        # gpu_worker.py); 0 (the default) loads without one.
+        self.cpu_load_staging_bytes = int(
+            self.extra_config.get("cpu_load_staging_bytes", 0)
+        )
+        # Replicated KV on several workers: each loads one chunk in world_size
+        # from the CPU tier and copies it to every worker over NVLink, so a
+        # chunk crosses PCIe once instead of once per worker. Needs staging.
+        self.cpu_load_fanout = bool(self.extra_config.get("cpu_load_fanout", False))
+        if self.cpu_load_fanout and not self.cpu_load_staging_bytes:
+            self.cpu_load_staging_bytes = 256 * 1024**2
 
     @classmethod
     @override
@@ -221,11 +232,21 @@ class CPUOffloadingSpec(OffloadingSpec):
                 mmap_region=mmap_region,
                 canonical_layout=self.canonical_layout,
                 cpu_to_gpu_copy=self.cpu_to_gpu_copy,
+                load_staging_bytes=self.cpu_load_staging_bytes,
+                load_fanout=self._load_fanout(),
             )
         except Exception:
             if mmap_region is not None:
                 mmap_region.cleanup()
             raise
+
+    def _load_fanout(self) -> "FanOut | None":
+        world_size = self.config.parallel.world_size
+        if not (self.cpu_load_fanout and self.replicated_layout and world_size > 1):
+            return None
+        from vllm.v1.kv_offload.obj.spec import _tp_all_gather
+
+        return FanOut(self.config.parallel.rank, world_size, _tp_all_gather)
 
     @override
     def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:

@@ -29,9 +29,11 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.cpu.host_register import host_register, host_unregister
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
+    MIN_N,
     THRESHOLD_BYTES,
     swap_blocks_batch,
 )
+from vllm.v1.kv_offload.obj.peers import AllGather, CrossRankFence, share_tensors
 from vllm.v1.kv_offload.pointer_utils import iter_pointer_groups
 
 logger = init_logger(__name__)
@@ -88,10 +90,278 @@ class Transfer:
     start_event: torch.Event
     end_event: torch.Event
     num_bytes: int
-    batch_src: torch.Tensor
-    batch_dst: torch.Tensor
-    batch_sizes: torch.Tensor
+    # Pooled descriptor buffers, or None for a staged load, which keeps its
+    # own descriptors alive in keepalive until it ends.
+    batch_src: torch.Tensor | None
+    batch_dst: torch.Tensor | None
+    batch_sizes: torch.Tensor | None
     failed: bool = False
+    keepalive: list[torch.Tensor] | None = None
+
+
+class _StagedLoads:
+    """CPU->GPU loads of whole chunk rows through a GPU staging buffer.
+
+    A chunk's pages for all layers lie next to each other in host memory (one
+    row of the region). Each piece of a load copies its chunks' rows into
+    staging slots with the copy engine, one copy per chunk, then scatters
+    them into the KV cache with the Triton kernel, GPU to GPU; pieces
+    alternate between the two halves of the buffer, so copies and scatters
+    overlap. One large copy per chunk runs at about the DMA rate, which
+    neither the kernel reading host memory nor many small copies reach.
+
+    With fan-out, for KV every worker holds whole (replicated layout), each
+    worker loads one chunk in world_size of a load and scatters it into every
+    worker's KV cache over NVLink (the others' caches mapped through CUDA
+    IPC): a chunk crosses PCIe and is read from host memory once instead of
+    once per worker. A CrossRankFence orders those writes after each worker's
+    own pending writes to its blocks.
+    """
+
+    @classmethod
+    def build(
+        cls,
+        gpu_tensors: list[torch.Tensor],
+        cpu_tensors: list[torch.Tensor],
+        layer_refs_per_group: list[list[CanonicalKVCacheRef]],
+        blocks_per_chunk: int,
+        canonical_layout: bool,
+        host_memory_is_pinned: bool,
+        staging_bytes: int,
+        fanout: "FanOut | None" = None,
+    ) -> "_StagedLoads | None":
+        """A staged loader, or None where it does not apply: it needs one KV
+        group, one block per chunk, the direct layout, pinned host rows and
+        the Triton kernel."""
+        if (
+            staging_bytes <= 0
+            or blocks_per_chunk != 1
+            or (
+                canonical_layout and not all(map(_is_identity, layer_refs_per_group[0]))
+            )
+            or len(layer_refs_per_group) != 1
+            or not host_memory_is_pinned
+            or not HAS_TRITON
+            or not current_platform.is_cuda()
+            or any(t.device.type != "cpu" for t in cpu_tensors)
+        ):
+            return None
+        row_stride = cpu_tensors[0].stride(0)
+        if any(t.stride(0) != row_stride or t.stride(1) != 1 for t in cpu_tensors):
+            return None
+        base = min(t.data_ptr() for t in cpu_tensors)
+        offsets = [t.data_ptr() - base for t in cpu_tensors]
+        row_bytes = max(o + t.shape[1] for o, t in zip(offsets, cpu_tensors))
+        if row_bytes > row_stride or staging_bytes // row_bytes < 2:
+            return None
+        return cls(
+            gpu_tensors,
+            layer_refs_per_group[0],
+            base,
+            row_stride,
+            row_bytes,
+            offsets,
+            staging_bytes,
+            fanout if fanout is not None and fanout.world_size > 1 else None,
+        )
+
+    def __init__(
+        self,
+        gpu_tensors: list[torch.Tensor],
+        refs: list[CanonicalKVCacheRef],
+        host_base: int,
+        row_stride: int,
+        row_bytes: int,
+        offsets: list[int],
+        staging_bytes: int,
+        fanout: "FanOut | None" = None,
+    ):
+        self._host_base = host_base
+        self._row_stride = row_stride
+        self._row_bytes = row_bytes
+        num_slots = staging_bytes // row_bytes
+        self._piece = num_slots // 2
+        self._staging = torch.empty(
+            2 * self._piece * row_bytes,
+            dtype=torch.int8,
+            device=gpu_tensors[0].device,
+        )
+        self._rank, self._world_size = 0, 1
+        self._fence: CrossRankFence | None = None
+        targets = [gpu_tensors]
+        if fanout is not None:
+            self._rank, self._world_size = fanout.rank, fanout.world_size
+            targets = share_tensors(gpu_tensors, fanout.rank, fanout.all_gather)
+            self._fence = CrossRankFence(
+                fanout.rank, fanout.world_size, fanout.all_gather
+            )
+        # Per ref: where its page sits in a row; per target worker and ref,
+        # its GPU tensor's base and page size.
+        self._src_offsets = np.array(
+            [offsets[r.tensor_idx] for r in refs], dtype=np.int64
+        )
+        self._dst_bases = [
+            np.array([t[r.tensor_idx].data_ptr() for r in refs], dtype=np.int64)
+            for t in targets
+        ]
+        self._dst_pages = [
+            np.array([t[r.tensor_idx].stride(0) for r in refs], dtype=np.int64)
+            for t in targets
+        ]
+        self._sizes = np.array([r.page_size_bytes for r in refs], dtype=np.int64)
+        self._bytes_per_chunk = int(self._sizes.sum())
+        self._kernel_chunk = min(triton.next_power_of_2(int(self._sizes.max())), 8192)
+        self._copy_stream = current_platform.Stream()
+        # One stream per target worker when there are several, so that the
+        # scatters into the workers run at once.
+        self._target_streams = (
+            [current_platform.Stream() for _ in targets] if len(targets) > 1 else []
+        )
+        # When each half of the buffer was last read by a scatter.
+        self._half_free: list[torch.Event | None] = [None, None]
+        self._next_half = 0
+
+    def enqueue(
+        self,
+        job_id: int,
+        chunk_ids: np.ndarray,
+        block_ids: np.ndarray,
+        start_event: torch.Event,
+        stream: torch.cuda.Stream,
+    ) -> tuple[int, list[torch.Tensor]]:
+        """Queue the load of these chunks into these GPU blocks after
+        start_event, its scatters ending on stream. Returns the bytes this
+        worker moves and the descriptor tensors to keep alive until stream
+        reaches them. With fan-out, every worker of the load must call it."""
+        if self._fence is not None:
+            # This worker's blocks are ready once its current stream is here.
+            self._fence.publish(job_id)
+            own = np.arange(len(chunk_ids)) % self._world_size == self._rank
+            chunk_ids, block_ids = chunk_ids[own], block_ids[own]
+        num_chunks = len(chunk_ids)
+        if num_chunks == 0:
+            return 0, []
+        num_refs = len(self._sizes)
+        num_targets = len(self._dst_bases)
+        chunks = chunk_ids.astype(np.int64)
+        blocks = block_ids.astype(np.int64)
+        index = np.arange(num_chunks, dtype=np.int64)
+        halves = (self._next_half + index // self._piece) % 2
+        slots = (
+            self._staging.data_ptr()
+            + halves * (self._piece * self._row_bytes)
+            + index % self._piece * self._row_bytes
+        )
+        copies = torch.from_numpy(
+            np.stack(
+                [
+                    self._host_base + chunks * self._row_stride,
+                    slots,
+                    np.full(num_chunks, self._row_bytes, dtype=np.int64),
+                ]
+            )
+        )
+        src = (slots[:, None] + self._src_offsets[None, :]).ravel()
+        sizes = np.broadcast_to(self._sizes, (num_chunks, num_refs)).ravel()
+        scatters_host = torch.from_numpy(
+            np.stack(
+                [
+                    np.stack(
+                        [src, (bases[None, :] + blocks[:, None] * pages).ravel(), sizes]
+                    )
+                    for bases, pages in zip(self._dst_bases, self._dst_pages)
+                ]
+            )
+        ).pin_memory()
+        # The whole load's scatter descriptors reach the GPU in one copy ahead
+        # of the rows: a small copy queued between two pieces' rows would wait
+        # behind them on the copy engine, and each scatter with it.
+        with current_platform.stream(stream):
+            scatters = scatters_host.to(self._staging.device, non_blocking=True)
+        if self._fence is not None:
+            # The other workers' blocks are ready for this job.
+            self._fence.wait(job_id, stream, _FANOUT_TIMEOUT_S)
+        for target_stream in self._target_streams:
+            target_stream.wait_stream(stream)
+        for begin in range(0, num_chunks, self._piece):
+            end = min(begin + self._piece, num_chunks)
+            half = int(halves[begin])
+            self._copy_stream.wait_event(start_event)
+            free = self._half_free[half]
+            if free is not None:
+                self._copy_stream.wait_event(free)
+            copied = torch.Event()
+            with current_platform.stream(self._copy_stream):
+                ops.swap_blocks_batch(
+                    copies[0, begin:end],
+                    copies[1, begin:end],
+                    copies[2, begin:end],
+                    is_src_access_order_any=True,
+                )
+                copied.record(self._copy_stream)
+            lo, hi = begin * num_refs, end * num_refs
+            # Too few copies for the kernel: the copy engine takes them, from
+            # host descriptors.
+            table = scatters if hi - lo >= MIN_N else scatters_host
+            for target in range(num_targets):
+                target_stream = (
+                    self._target_streams[target] if self._target_streams else stream
+                )
+                target_stream.wait_event(copied)
+                with current_platform.stream(target_stream):
+                    swap_blocks_batch(
+                        table[target, 0, lo:hi],
+                        table[target, 1, lo:hi],
+                        table[target, 2, lo:hi],
+                        bytes_per_chunk=self._kernel_chunk,
+                    )
+                if self._target_streams:
+                    done = torch.Event()
+                    done.record(target_stream)
+                    stream.wait_event(done)
+            scattered = torch.Event()
+            scattered.record(stream)
+            self._half_free[half] = scattered
+        self._next_half = int(halves[-1]) ^ 1
+        moved = num_chunks * self._bytes_per_chunk * num_targets
+        return moved, [copies, scatters_host, scatters]
+
+    def close(self) -> None:
+        if self._fence is not None:
+            self._fence.close()
+            self._fence = None
+
+
+def _is_identity(ref: CanonicalKVCacheRef) -> bool:
+    """Whether the ref's canonical page is its GPU page byte for byte (MLA
+    without context parallelism): staged loads then copy it as is."""
+    mapping = ref.mapping
+    if mapping is None or len(mapping.runs) != 1:
+        return False
+    (run,) = mapping.runs
+    page = mapping.local_page_size_bytes
+    return (
+        mapping.canonical_page_size_bytes == page == ref.page_size_bytes
+        and run.local_offset == run.canonical_offset == 0
+        and run.fragment_size * run.num_fragments == page
+        and (
+            run.num_fragments == 1
+            or run.local_stride == run.canonical_stride == run.fragment_size
+        )
+    )
+
+
+class FanOut(NamedTuple):
+    """The workers among which CPU->GPU loads of replicated KV are shared out
+    (see _StagedLoads)."""
+
+    rank: int
+    world_size: int
+    all_gather: "AllGather"
+
+
+# How long a fan-out load waits for the other workers to receive it.
+_FANOUT_TIMEOUT_S = 60.0
 
 
 def compute_sub_block_ptrs(
@@ -305,6 +575,9 @@ class SingleDirectionOffloadingHandler:
     executing only after the streams of previous transfers have finished.
     """
 
+    # CPU->GPU loads through a GPU staging buffer, if enabled.
+    _staged: _StagedLoads | None = None
+
     def __init__(
         self,
         cpu_tensors: list[torch.Tensor],
@@ -314,6 +587,10 @@ class SingleDirectionOffloadingHandler:
         canonical_layout: bool = False,
         host_memory_is_pinned: bool = True,
         prefer_triton: bool = False,
+        staging_bytes: int = 0,
+        fanout: FanOut | None = None,
+        gpu_tensors: list[torch.Tensor] | None = None,
+        ptr_strides: list[int] | None = None,
     ):
         """Initialize a SingleDirectionOffloadingHandler.
 
@@ -330,6 +607,14 @@ class SingleDirectionOffloadingHandler:
                 kernels may dereference them directly.
             prefer_triton: copy CPU->GPU with the Triton kernel whatever the
                 page size, where the platform allows it.
+            staging_bytes: CPU->GPU, a GPU staging buffer of this size, if
+                above zero, for the loads it can take (_StagedLoads).
+            fanout: CPU->GPU, with staging_bytes, share loads of replicated
+                KV out among these workers (_StagedLoads).
+            gpu_tensors: the KV cache tensors as int8 pages, which staged
+                loads require.
+            ptr_strides: per KV cache tensor, the stride the device pointers
+                of a transfer were resolved with (resolve_device_pointers).
 
         """
         assert len(cpu_tensors) > 0
@@ -346,6 +631,24 @@ class SingleDirectionOffloadingHandler:
             layer_refs_per_group, gpu_to_cpu, host_memory_is_pinned, prefer_triton
         )
         self.blocks_per_chunk = blocks_per_chunk
+        # Staged loads write the GPU tensors themselves, so they need them;
+        # the pointers of a load give its blocks (see _block_ids).
+        self._gpu_tensors = gpu_tensors
+        self._ptr_strides = ptr_strides
+        self._staged = (
+            None
+            if gpu_to_cpu or gpu_tensors is None
+            else _StagedLoads.build(
+                gpu_tensors,
+                cpu_tensors,
+                layer_refs_per_group,
+                blocks_per_chunk,
+                canonical_layout,
+                host_memory_is_pinned,
+                staging_bytes,
+                fanout,
+            )
+        )
 
         # Per (group, ref) static copy plans for the canonical layout
         self._canonical_copy_plans: list[list[CopyPlan]] | None = (
@@ -559,6 +862,11 @@ class SingleDirectionOffloadingHandler:
         assert cpu_blocks.ndim == 1
         num_cpu_blocks = len(cpu_blocks)
 
+        if self._staged is not None:
+            return self._staged_transfer(
+                job_id, cpu_spec.block_ids, self._block_ids(device_ptrs)
+            )
+
         num_copy_ops = self._estimate_max_copy_ops(device_ptrs.group_block_counts)
 
         # reuse a pooled buffer set, growing it if this transfer needs more room
@@ -692,6 +1000,64 @@ class SingleDirectionOffloadingHandler:
         # success
         return True
 
+    def _block_ids(self, device_ptrs: DevicePointers) -> np.ndarray:
+        """The GPU blocks of a transfer of one KV cache group, from the
+        pointers of its first data ref."""
+        assert self._gpu_tensors is not None and self._ptr_strides is not None
+        assert len(device_ptrs.group_block_counts) == 1
+        num_blocks = device_ptrs.group_block_counts[0]
+        t_idx = self.layer_refs_per_group[0][0].tensor_idx
+        offsets = device_ptrs.ptrs[:num_blocks] - np.uint64(
+            self._gpu_tensors[t_idx].data_ptr()
+        )
+        return offsets // np.uint64(self._ptr_strides[t_idx])
+
+    def _staged_transfer(
+        self, job_id: int, chunk_ids: np.ndarray, block_ids: np.ndarray
+    ) -> bool:
+        """A load through the staging buffer, ordered as transfer_async
+        orders the others."""
+        staged = self._staged
+        assert staged is not None and len(chunk_ids) == len(block_ids)
+        stream = (
+            self._stream_pool.pop() if self._stream_pool else current_platform.Stream()
+        )
+        start_event = (
+            self._event_pool.pop()
+            if self._event_pool
+            else torch.Event(enable_timing=True)
+        )
+        end_event = (
+            self._event_pool.pop()
+            if self._event_pool
+            else torch.Event(enable_timing=True)
+        )
+        # As transfer_async: after pending writes to the destination blocks,
+        # and after the previous transfer.
+        stream.wait_stream(current_platform.current_stream())
+        if self._transfers:
+            stream.wait_event(self._transfers[-1].end_event)
+        start_event.record(stream)
+        num_bytes, keepalive = staged.enqueue(
+            job_id, chunk_ids, block_ids, start_event, stream
+        )
+        end_event.record(stream)
+        self._transfer_events[job_id] = end_event
+        self._transfers.append(
+            Transfer(
+                job_id=job_id,
+                stream=stream,
+                start_event=start_event,
+                end_event=end_event,
+                num_bytes=num_bytes,
+                batch_src=None,
+                batch_dst=None,
+                batch_sizes=None,
+                keepalive=keepalive,
+            )
+        )
+        return True
+
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
         while self._transfers:
@@ -734,9 +1100,12 @@ class SingleDirectionOffloadingHandler:
             self._stream_pool.append(transfer.stream)
             self._event_pool.append(transfer.end_event)
             self._event_pool.append(transfer.start_event)
-            self._buffer_pool.append(
-                (transfer.batch_src, transfer.batch_dst, transfer.batch_sizes)
-            )
+            if transfer.batch_src is not None:
+                assert transfer.batch_dst is not None
+                assert transfer.batch_sizes is not None
+                self._buffer_pool.append(
+                    (transfer.batch_src, transfer.batch_dst, transfer.batch_sizes)
+                )
         return results
 
     def wait(self, job_ids: set[int]):
@@ -775,6 +1144,8 @@ class SingleDirectionOffloadingHandler:
         self._event_pool.clear()
         self._buffer_pool.clear()
         self.cpu_tensors.clear()
+        if self._staged is not None:
+            self._staged.close()
         if sync_error is not None:
             raise sync_error
 
@@ -795,6 +1166,8 @@ class CPUOffloadingWorker(OffloadingWorker):
         mmap_region: SharedOffloadRegion | None = None,
         canonical_layout: bool = False,
         cpu_to_gpu_copy: str = "auto",
+        load_staging_bytes: int = 0,
+        load_fanout: FanOut | None = None,
     ):
         assert not canonical_layout or mmap_region is not None
         assert cpu_to_gpu_copy in ("auto", "triton"), cpu_to_gpu_copy
@@ -856,8 +1229,20 @@ class CPUOffloadingWorker(OffloadingWorker):
             prefer_triton=cpu_to_gpu_copy == "triton",
         )
         self._store_handler = make_handler(gpu_to_cpu=True)
-        self._load_handler = make_handler(gpu_to_cpu=False)
+        staged: dict = {}
+        if load_staging_bytes > 0:
+            staged = dict(
+                staging_bytes=load_staging_bytes,
+                fanout=load_fanout,
+                gpu_tensors=[
+                    t.tensor.view(torch.int8).view((-1, t.page_size_bytes))
+                    for t in kv_caches.tensors
+                ],
+                ptr_strides=[t.tensor.stride(0) for t in kv_caches.tensors],
+            )
+        self._load_handler = make_handler(gpu_to_cpu=False, **staged)
         # Own stream, so expedited loads do not queue behind regular loads.
+        # They are small: no staging buffer of their own.
         self._expedited_load_handler = make_handler(gpu_to_cpu=False)
 
     def submit_store(

@@ -602,6 +602,8 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 mmap_region=worker_mmap,
                 canonical_layout=self.config.canonical_layout,
                 cpu_to_gpu_copy=self.cpu_to_gpu_copy,
+                load_staging_bytes=self.cpu_load_staging_bytes,
+                load_fanout=self._load_fanout(),
             )
         except Exception:
             worker_mmap.cleanup()
