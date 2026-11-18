@@ -477,6 +477,17 @@ class OffloadingManager(ABC):
         not track that, so the caller judges by this instance's stores."""
         return None
 
+    def expect_stored(
+        self, keys: Collection[OffloadKey], req_context: ReqContext, deadline: float
+    ) -> bool:
+        """Chunks another instance is storing, which a ring_wait request waits
+        for until deadline (time.monotonic()). A manager that returns True
+        reports them HIT_PENDING with is_promotion_pending(), then each as
+        promoted once it is stored or failed past the deadline, through
+        take_promotion_results(): the request loads them as they arrive.
+        False (the default): the request waits until all are stored."""
+        return False
+
     def is_promotion_pending(self, key: OffloadKey) -> bool:
         """Whether a HIT_PENDING key is pending because it is being promoted
         from a lower tier, which reserve_load() can wait for."""

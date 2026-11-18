@@ -147,6 +147,7 @@ class MockOffloadingSpec(OffloadingSpec):
         # As OffloadingManager: no promotion is ever pending.
         self.manager.is_promotion_pending.return_value = False
         self.manager.take_promotion_results.return_value = ((), ())
+        self.manager.expect_stored.return_value = False
         self.manager.get_load_source.return_value = CacheHitSource.EXTERNAL_UNSPECIFIED
         self.manager.get_stats.return_value = None
         self.manager.on_new_request.return_value = RequestOffloadingContext()
