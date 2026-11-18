@@ -722,3 +722,158 @@ def test_load_waits_for_pending_compute_stream_writes(default_vllm_config) -> No
                 torch.testing.assert_close(gpu_tensor[block_id].cpu(), expected)
     finally:
         worker.shutdown()
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not gpu_worker.HAS_TRITON,
+    reason="Requires CUDA and Triton",
+)
+def test_staged_loads_match_direct_loads():
+    """Loads through the staging buffer write exactly what direct loads write:
+    each chunk's pages, laid out in one host row, into its GPU block."""
+    pages = [256, 64, 128]
+    row = sum(pages)
+    num_chunks, num_blocks = 12, 20
+    host = torch.randint(-128, 127, (num_chunks * row,), dtype=torch.int8)
+    host = host.pin_memory()
+    cpu_tensors = []
+    offset = 0
+    for page in pages:
+        cpu_tensors.append(host.as_strided((num_chunks, page), (row, 1), offset))
+        offset += page
+    refs = [[CanonicalKVCacheRef(i, page) for i, page in enumerate(pages)]]
+    chunks = [3, 0, 7, 11, 5, 1, 9, 2, 8, 6]
+    blocks = [10, 2, 19, 4, 6, 0, 13, 7, 15, 1]
+
+    results = []
+    # 16 slots: a piece of 8 chunks scattered by the Triton kernel, then 2.
+    for staging_bytes in (0, 16 * row):
+        gpu_tensors = [
+            torch.zeros((num_blocks, page), dtype=torch.int8, device="cuda")
+            for page in pages
+        ]
+        handler = gpu_worker.SingleDirectionOffloadingHandler(
+            list(gpu_tensors),
+            list(cpu_tensors),
+            1,
+            refs,
+            gpu_to_cpu=False,
+            staging_bytes=staging_bytes,
+        )
+        assert (handler._staged is not None) == bool(staging_bytes)
+        handler.transfer_async(
+            1,
+            CPULoadStoreSpec(chunks),
+            GPULoadStoreSpec(blocks, group_sizes=[len(blocks)], block_indices=[0]),
+        )
+        torch.accelerator.synchronize()
+        (result,) = handler.get_finished()
+        assert result.success and result.transfer_size == len(chunks) * row
+        handler.shutdown()
+        results.append([t.cpu() for t in gpu_tensors])
+
+    for direct, staged, cpu_tensor in zip(*results, cpu_tensors):
+        assert torch.equal(direct, staged)
+        for chunk, block in zip(chunks, blocks):
+            assert torch.equal(staged[block], cpu_tensor[chunk])
+
+
+def _fanout_worker(rank: int, port: int, result_queue) -> None:
+    import torch.distributed as dist
+
+    torch.accelerator.set_device_index(rank)
+    dist.init_process_group(
+        "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2
+    )
+
+    def all_gather(obj):
+        gathered = [None, None]
+        dist.all_gather_object(gathered, obj)
+        return gathered
+
+    pages = [256, 64, 128]
+    row = sum(pages)
+    num_chunks, num_blocks = 12, 20
+    # Every worker reads the same host rows, as with the replicated layout.
+    gen = torch.Generator().manual_seed(0)
+    host = torch.randint(
+        -128, 127, (num_chunks * row,), dtype=torch.int8, generator=gen
+    ).pin_memory()
+    cpu_tensors, offset = [], 0
+    for page in pages:
+        cpu_tensors.append(host.as_strided((num_chunks, page), (row, 1), offset))
+        offset += page
+    gpu_tensors = [
+        torch.zeros((num_blocks, page), dtype=torch.int8, device="cuda")
+        for page in pages
+    ]
+    handler = gpu_worker.SingleDirectionOffloadingHandler(
+        list(gpu_tensors),
+        list(cpu_tensors),
+        1,
+        [[CanonicalKVCacheRef(i, page) for i, page in enumerate(pages)]],
+        gpu_to_cpu=False,
+        staging_bytes=16 * row,
+        fanout=gpu_worker.FanOut(rank, 2, all_gather),
+    )
+    chunks = [3, 0, 7, 11, 5, 1, 9, 2, 8, 6]
+    blocks = [10, 2, 19, 4, 6, 0, 13, 7, 15, 1]
+    handler.transfer_async(
+        1,
+        CPULoadStoreSpec(chunks),
+        GPULoadStoreSpec(blocks, group_sizes=[len(blocks)], block_indices=[0]),
+    )
+    torch.accelerator.synchronize()
+    (result,) = handler.get_finished()
+    dist.barrier()  # every worker has written its chunks into both caches
+    loaded = all(
+        torch.equal(gpu[block].cpu(), cpu[chunk])
+        for gpu, cpu in zip(gpu_tensors, cpu_tensors)
+        for chunk, block in zip(chunks, blocks)
+    )
+    result_queue.put((rank, result.success, result.transfer_size, loaded))
+    dist.barrier()
+    handler.shutdown()
+    dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 2, reason="needs 2 GPUs")
+def test_fanout_loads_fill_every_worker():
+    """With fan-out, each worker loads half of the chunks from host memory and
+    writes them into both workers' KV caches: each cache ends up with all."""
+    import torch.multiprocessing as mp
+
+    from vllm.utils.network_utils import get_open_port
+
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    mp.spawn(_fanout_worker, args=(get_open_port(), result_queue), nprocs=2)
+    results = sorted(result_queue.get() for _ in range(2))
+    row = 256 + 64 + 128
+    assert all(success and loaded for _, success, _, loaded in results)
+    # Each worker moved its 5 chunks into 2 caches.
+    assert [size for _, _, size, _ in results] == [5 * row * 2] * 2
+
+
+def test_staged_loads_take_canonical_pages_that_are_the_gpu_pages():
+    """A canonical page that is the GPU page byte for byte (MLA) loads like a
+    direct one; one assembled from fragments (sharded heads) does not."""
+    from vllm.v1.kv_offload.base import CanonicalPageMapping, CopyRun
+
+    def ref(runs, canonical_size=256):
+        mapping = CanonicalPageMapping(
+            canonical_page_size_bytes=canonical_size,
+            local_page_size_bytes=256,
+            runs=tuple(runs),
+            num_writers=2,
+            writer_index=0,
+            parallelism_agnostic=True,
+        )
+        return CanonicalKVCacheRef(0, 256, mapping)
+
+    assert gpu_worker._is_identity(ref([CopyRun(0, 0, 256, 1, 256, 256)]))
+    assert gpu_worker._is_identity(ref([CopyRun(0, 0, 64, 4, 64, 64)]))
+    assert not gpu_worker._is_identity(
+        ref([CopyRun(0, 128, 64, 2, 64, 256)], canonical_size=512)
+    )
+    assert not gpu_worker._is_identity(CanonicalKVCacheRef(0, 256))
