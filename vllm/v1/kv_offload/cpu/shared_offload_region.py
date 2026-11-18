@@ -103,6 +103,8 @@ class SharedOffloadRegion:
     share, for layouts where every worker maps the same bytes. The barrier
     also waits for all shards to finish pre-faulting before returning.
     ``num_segments`` splits backing files beneath the contiguous mapping.
+    ``unlink_when_mapped`` unlinks the paths once mapped, without a barrier,
+    for a caller that opens the files after every other process has.
     """
 
     BLOCK_SIZE_ALIGNMENT: int = mmap.PAGESIZE
@@ -119,6 +121,7 @@ class SharedOffloadRegion:
         creator_memory_check: Callable[[int], None] | None = None,
         populate_shard: tuple[int, int] | None = None,
         num_segments: int = 1,
+        unlink_when_mapped: bool = False,
     ) -> None:
         self.page_size = mmap.PAGESIZE
         assert kv_bytes_per_chunk % self.page_size == 0
@@ -214,6 +217,18 @@ class SharedOffloadRegion:
                 if self._creator:
                     self._unlink()
                     self._creator = False
+                    logger.info("Unlinked mmap file %s", self.mmap_path)
+            elif unlink_when_mapped:
+                # The caller opens the files after every other process has, so
+                # their paths can go once mapped, as with a barrier.
+                if self._creator:
+                    logger.warning(
+                        "Created mmap file %s although every other process "
+                        "should have opened it first; keeping its path",
+                        self.mmap_path,
+                    )
+                else:
+                    self._unlink()
                     logger.info("Unlinked mmap file %s", self.mmap_path)
             if populate_shard is not None:
                 populate_write_fn = _get_populate_write_fn(self.mmap_obj)
@@ -467,6 +482,8 @@ class SharedOffloadRegion:
             try:
                 self._unlink()
                 logger.info("Removed mmap file %s", self.mmap_path)
+            except FileNotFoundError:
+                pass  # unlinked by the process that opened it last
             except Exception:
                 logger.warning(
                     "Failed to unlink path %s", self.mmap_path, exc_info=True
