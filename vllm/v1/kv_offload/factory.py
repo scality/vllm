@@ -70,3 +70,6 @@ OffloadingSpecFactory.register_spec(
 OffloadingSpecFactory.register_spec(
     "ObjOffloadingSpec", "vllm.v1.kv_offload.obj.spec", "ObjOffloadingSpec"
 )
+OffloadingSpecFactory.register_spec(
+    "HybridOffloadingSpec", "vllm.v1.kv_offload.hybrid.spec", "HybridOffloadingSpec"
+)

@@ -126,6 +126,9 @@ class CPUOffloadingSpec(OffloadingSpec):
             # or |--- C0 (single copy) ---| *** maybe-pad *** |
             self.kv_bytes_per_chunk = aligned_kv_bytes_per_chunk
 
+        # Whether host pages hold the canonical layout (see canonical_layout)
+        self.canonical_layout = False
+
         # scheduler-side
         self._manager: OffloadingManager | None = None
 
@@ -199,6 +202,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 blocks_per_chunk=self.blocks_per_chunk,
                 num_cpu_chunks=self.num_chunks,
                 mmap_region=mmap_region,
+                canonical_layout=self.canonical_layout,
                 cpu_to_gpu_copy=self.cpu_to_gpu_copy,
             )
         except Exception:
