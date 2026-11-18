@@ -87,6 +87,11 @@ class ObjOffloadingManager(OffloadingManager):
         load since."""
         return key in self._stored
 
+    def in_store(self, key: OffloadKey) -> bool:
+        """Whether the chunk is in the store, as far as this instance knows:
+        it stored or loaded it, or a lookup found it."""
+        return key in self._stored or self._lookup_manager.cached_result(key) is True
+
     def note_loaded(self, keys: Collection[OffloadKey]) -> None:
         """Remember chunks loaded from the store as held, like those stored."""
         self._remember(keys)

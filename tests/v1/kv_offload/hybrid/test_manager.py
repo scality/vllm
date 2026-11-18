@@ -212,3 +212,12 @@ def test_measured_load_times_move_the_split(make_manager, ctx):
     load = manager.prepare_load(keys, ctx)
     assert len(load.obj_chunks) < 8
     manager.complete_load(keys, ctx)
+
+
+def test_only_the_object_store_makes_chunks_shared(make_manager, ctx):
+    manager = make_manager(num_cpu_chunks=8)
+    out = manager.prepare_store([_key(0)], ctx)
+    assert out is not None
+    assert not manager.shared_holds(_key(0))  # still being stored
+    manager.complete_store(out.keys_to_store, ctx)
+    assert manager.shared_holds(_key(0))

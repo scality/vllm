@@ -32,6 +32,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     _ConnectorMetricName,
     _TransferMetricName,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.ring_notify import (
+    RingNotifier,
+)
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -171,6 +174,7 @@ class SchedulerOffloadConfig(NamedTuple):
     offload_prompt_only: bool
     supports_partial_tail: bool
     min_load_tokens: int = 0
+    ring_notify_hosts: frozenset[str] = frozenset()
     alignment_tokens: int | None = None
     retention_interval: int | None = None
     dcp_world_size: int = 1
@@ -324,6 +328,7 @@ class SchedulerOffloadConfig(NamedTuple):
             offload_prompt_only=spec.offload_prompt_only,
             supports_partial_tail=supports_partial_tail,
             min_load_tokens=spec.min_load_tokens,
+            ring_notify_hosts=getattr(spec, "ring_notify_hosts", frozenset()),
             alignment_tokens=alignment_tokens,
             retention_interval=retention_interval,
             dcp_world_size=vllm_config.parallel_config.decode_context_parallel_size,
@@ -402,6 +407,12 @@ class RequestOffloadState:
     ring_wait_timeout: float = 0.0
     ring_wait_deadline: float | None = None
     ring_wait_next_requery: float = 0.0
+    # ring_notify: where to report that the prompt, but its last
+    # ring_notify_tokens_left tokens, is stored; None once reported.
+    ring_notify_url: str | None = None
+    ring_notify_tokens_left: int = 0
+    # ... or this share of the prompt, if more.
+    ring_notify_tokens_left_ratio: float = 0.0
     # time.monotonic() of this request's first deferred offload lookup;
     # None once consumed (observed) or while no lookup is pending.
     deferred_lookup_start_time: float | None = None
@@ -456,6 +467,30 @@ class RequestOffloadState:
                 logger.warning(
                     "ring_wait must be {'num_tokens': int > 0, 'timeout_ms': "
                     "int >= 0}, got %r; ignoring",
+                    raw,
+                )
+
+        # NOTE: This field is experimental and subject to change in the future.
+        raw = params.get("ring_notify") if params else None
+        if raw is not None:
+            url = raw.get("url") if isinstance(raw, dict) else None
+            tokens_left = raw.get("tokens_left", 0) if isinstance(raw, dict) else None
+            ratio = raw.get("tokens_left_ratio", 0) if isinstance(raw, dict) else None
+            if (
+                isinstance(url, str)
+                and type(tokens_left) is int
+                and tokens_left >= 0
+                and isinstance(ratio, (int, float))
+                and not isinstance(ratio, bool)
+                and 0 <= ratio <= 1
+            ):
+                self.ring_notify_url = url
+                self.ring_notify_tokens_left = tokens_left
+                self.ring_notify_tokens_left_ratio = float(ratio)
+            else:
+                logger.warning(
+                    "ring_notify must be {'url': str, 'tokens_left': int >= 0, "
+                    "'tokens_left_ratio': float in [0, 1]}, got %r; ignoring",
                     raw,
                 )
 
@@ -714,6 +749,13 @@ class OffloadingConnectorScheduler:
         # Requests with a streaming load, and the requests whose streamed
         # load ended this step (True if it failed).
         self._streaming_loads: dict[ReqId, RequestOffloadState] = {}
+        # Requests whose ring_notify is still due, and who sends them.
+        self._ring_notify_reqs: dict[ReqId, RequestOffloadState] = {}
+        self._ring_notifier = (
+            RingNotifier(self.config.ring_notify_hosts)
+            if self.config.ring_notify_hosts
+            else None
+        )
         self._load_ends: dict[ReqId, bool] = {}
 
         # used by _lookup
@@ -1450,6 +1492,8 @@ class OffloadingConnectorScheduler:
         self._events_tracker.on_new_request(
             req_context, request, self.config.kv_group_configs
         )
+        if req_status.ring_notify_url is not None:
+            self._ring_notify_reqs[request.request_id] = req_status
 
     def get_num_new_matched_tokens(
         self,
@@ -1637,6 +1681,86 @@ class OffloadingConnectorScheduler:
             self.manager.requery_misses(keys, req_status.req_context)
             req_status.ring_wait_next_requery = now + _RING_WAIT_REQUERY_INTERVAL
         return True
+
+    def _ring_stored_tokens(self, req_status: RequestOffloadState) -> int:
+        """Prompt tokens of the request other instances can read: the leading
+        chunks the manager knows to be in a shared store or, if it does not
+        track that, those before each full-attention group's store frontier,
+        up to the first one still being stored."""
+        stored: int | None = None
+        for group_idx in self._full_attention_groups:
+            offload_keys = req_status.group_states[group_idx].offload_keys
+            chunks = 0
+            for key in offload_keys:
+                shared = self.manager.shared_holds(key)
+                if shared is None:
+                    return self._stored_frontier_tokens(req_status)
+                if not shared:
+                    break
+                chunks += 1
+            tokens = chunks * self.config.kv_group_configs[group_idx].tokens_per_chunk
+            stored = tokens if stored is None else min(stored, tokens)
+        return stored or 0
+
+    def _stored_frontier_tokens(self, req_status: RequestOffloadState) -> int:
+        storing = {
+            key
+            for job_id in req_status.transfer_jobs
+            if (job := self._jobs.get(job_id)) is not None and job.is_store
+            for key in job.keys
+        }
+        stored: int | None = None
+        for group_idx in self._full_attention_groups:
+            group_state = req_status.group_states[group_idx]
+            chunks = group_state.next_stored_chunk_idx
+            for chunk_idx, key in enumerate(group_state.offload_keys[:chunks]):
+                if key in storing:
+                    chunks = chunk_idx
+                    break
+            tokens = chunks * self.config.kv_group_configs[group_idx].tokens_per_chunk
+            stored = tokens if stored is None else min(stored, tokens)
+        return stored or 0
+
+    def _maybe_ring_notify(self, req_status: RequestOffloadState) -> None:
+        """Send the request's ring_notify once the store holds what a decode
+        instance's ring_wait waits for (its prompt in whole chunks, without
+        the last token) but ring_notify_tokens_left."""
+        url = req_status.ring_notify_url
+        if url is None or not self._full_attention_groups:
+            return
+        req = req_status.req
+        tokens_per_chunk = max(
+            self.config.kv_group_configs[i].tokens_per_chunk
+            for i in self._full_attention_groups
+        )
+        waited_for = round_down(req.num_prompt_tokens - 1, tokens_per_chunk)
+        # The lead: tokens_left, or a share of the prompt if more, so that the
+        # decode load of what is stored ends about when the prefill does. At
+        # least one chunk is stored first: earlier, the decode instance would
+        # only hold its blocks waiting.
+        lead = max(
+            req_status.ring_notify_tokens_left,
+            round(req_status.ring_notify_tokens_left_ratio * req.num_prompt_tokens),
+        )
+        lead = min(lead, max(waited_for - tokens_per_chunk, 0))
+        stored = self._ring_stored_tokens(req_status)
+        if stored < waited_for - lead:
+            return
+        req_status.ring_notify_url = None
+        self._ring_notify_reqs.pop(req.request_id, None)
+        if self._ring_notifier is None:
+            logger.warning_once(
+                "ring_notify needs ring_notify_hosts in kv_connector_extra_config"
+            )
+            return
+        self._ring_notifier.notify(
+            url,
+            {
+                "request_id": req.request_id,
+                "stored_tokens": stored,
+                "num_prompt_tokens": req.num_prompt_tokens,
+            },
+        )
 
     def get_external_cache_hit_sources(
         self,
@@ -2730,6 +2854,11 @@ class OffloadingConnectorScheduler:
 
         partial_store_jobs = self._build_partial_tail_store_jobs(scheduler_output)
         normal_store_jobs = self._build_store_jobs(scheduler_output)
+        for req_id, req_status in list(self._ring_notify_reqs.items()):
+            if self._req_status.get(req_id) is not req_status:
+                del self._ring_notify_reqs[req_id]  # ended without notifying
+            else:
+                self._maybe_ring_notify(req_status)
         meta = OffloadingConnectorMetadata(
             load_jobs=self._current_batch_load_jobs,
             store_jobs=partial_store_jobs | normal_store_jobs,
@@ -2905,6 +3034,8 @@ class OffloadingConnectorScheduler:
 
             del self._jobs[job_id]
             req_status.transfer_jobs.remove(job_id)
+            if job_status.is_store:
+                self._maybe_ring_notify(req_status)
             if (
                 req_status.finished_signaled
                 and not req_status.transfer_jobs
@@ -3084,3 +3215,5 @@ class OffloadingConnectorScheduler:
 
     def shutdown(self) -> None:
         self.manager.shutdown()
+        if self._ring_notifier is not None:
+            self._ring_notifier.shutdown()

@@ -166,6 +166,12 @@ class AsyncLookupManager(ABC):
         self._req_keys.setdefault(req_id, set()).add(key)
         return state.result
 
+    def cached_result(self, key: OffloadKey) -> bool | None:
+        """The last lookup's answer for this key, while a request that looked
+        it up is alive; None if unknown. Starts no lookup."""
+        state = self._lookup_state.get(key)
+        return None if state is None else state.result
+
     def flush(self) -> None:
         """Post this step's accumulated keys to the worker thread.
 
