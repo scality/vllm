@@ -82,6 +82,15 @@ class ObjOffloadingManager(OffloadingManager):
             return LookupResult.RETRY
         return LookupResult.HIT if result else LookupResult.MISS
 
+    def holds(self, key: OffloadKey) -> bool:
+        """Whether this instance stored or loaded the chunk, with no failed
+        load since."""
+        return key in self._stored
+
+    def note_loaded(self, keys: Collection[OffloadKey]) -> None:
+        """Remember chunks loaded from the store as held, like those stored."""
+        self._remember(keys)
+
     def get_load_source(
         self, key: OffloadKey, req_context: ReqContext
     ) -> CacheHitSource:
@@ -137,8 +146,10 @@ class ObjOffloadingManager(OffloadingManager):
         success: bool = True,
     ) -> None:
         self._storing.difference_update(keys)
-        if not success:
-            return
+        if success:
+            self._remember(keys)
+
+    def _remember(self, keys: Collection[OffloadKey]) -> None:
         for key in keys:
             self._stored[key] = None
             self._stored.move_to_end(key)
