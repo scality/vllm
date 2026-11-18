@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingWorkerMetadata,
     ReqId,
     TransferJob,
+    merge_part_times,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
     _group_kv_bytes_per_block,
@@ -97,6 +98,8 @@ class TransferJobStatus:
     deferred_fence_block_ids: list[int] | None = None
     # Store source blocks fenced when the transfer is created.
     fenced_block_ids: list[int] | None = None
+    # A load's seconds per medium, slowest worker, when its workers timed them.
+    part_times: dict[str, float] | None = None
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -2847,6 +2850,10 @@ class OffloadingConnectorScheduler:
             if job_id in meta.failed_jobs:
                 job_status.failed = True
             job_status.pending_count -= count
+            if job_id in meta.part_times:
+                if job_status.part_times is None:
+                    job_status.part_times = {}
+                merge_part_times(job_status.part_times, meta.part_times[job_id])
             if job_status.pending_count > 0:
                 continue
             assert job_status.pending_count == 0
@@ -2874,6 +2881,10 @@ class OffloadingConnectorScheduler:
                         job_status.req_id,
                     )
                     req_status.load_failed = True
+                if job_status.part_times and not job_status.failed:
+                    self.manager.record_load_times(
+                        job_status.keys, req_status.req_context, job_status.part_times
+                    )
                 self.manager.complete_load(job_status.keys, req_status.req_context)
                 if job_status.failed:
                     self.manager.mark_load_failed(

@@ -93,7 +93,9 @@ def test_a_split_load_finishes_with_both_parts():
     cpu.finish(cpu_id)
     assert worker.get_finished() == []
     obj.finish(obj_id, success=False)
-    assert worker.get_finished() == [TransferResult(7, False, 20, 0.5)]
+    assert worker.get_finished() == [
+        TransferResult(7, False, 20, 0.5, {"cpu": 0.5, "obj": 0.5})
+    ]
 
 
 @pytest.mark.cpu_test

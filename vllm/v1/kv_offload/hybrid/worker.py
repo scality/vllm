@@ -3,7 +3,7 @@
 """Worker side of offloading KV to host memory and an object store at once:
 each part of a transfer runs as a job of its own medium's worker."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
@@ -17,14 +17,19 @@ from vllm.v1.kv_offload.pointer_utils import select_device_chunks
 
 logger = init_logger(__name__)
 
+# Names of the media in TransferResult.part_times.
+MEDIA = ("cpu", "obj")
+
 
 @dataclass
 class _Transfer:
     job_id: int
+    is_store: bool
     parts_left: int
     success: bool = True
     size: int = 0
     time: float = 0.0
+    part_times: dict[str, float] = field(default_factory=dict)
 
 
 class HybridOffloadingWorker(OffloadingWorker):
@@ -62,7 +67,7 @@ class HybridOffloadingWorker(OffloadingWorker):
         if not parts:
             self._finished.append(TransferResult(job_id, True))
             return True
-        transfer = _Transfer(job_id, len(parts))
+        transfer = _Transfer(job_id, is_store, len(parts))
         self._part_ids[job_id] = []
         for medium, chunks, sub_spec in parts:
             part_id = self._next_part_id
@@ -104,10 +109,12 @@ class HybridOffloadingWorker(OffloadingWorker):
                 transfer.success &= result.success
                 transfer.size += result.transfer_size or 0
                 transfer.time = max(transfer.time, result.transfer_time or 0.0)
+                if result.transfer_time is not None and not transfer.is_store:
+                    transfer.part_times[MEDIA[medium]] = result.transfer_time
                 logger.debug(
                     "job %d: %s part done in %.1f ms (%d bytes)",
                     transfer.job_id,
-                    ("cpu", "obj")[medium],
+                    MEDIA[medium],
                     (result.transfer_time or 0.0) * 1e3,
                     result.transfer_size or 0,
                 )
@@ -120,6 +127,7 @@ class HybridOffloadingWorker(OffloadingWorker):
                             transfer.success,
                             transfer.size or None,
                             transfer.time or None,
+                            transfer.part_times or None,
                         )
                     )
         return finished

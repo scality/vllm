@@ -431,6 +431,24 @@ class OffloadingManager(ABC):
         """
         return
 
+    def record_load_times(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+        part_times: dict[str, float],
+    ) -> None:
+        """Called before complete_load() for a load whose worker reported how
+        long each medium took (TransferResult.part_times), slowest worker
+        first.
+
+        Args:
+            keys: the keys identifying the blocks.
+            req_context: per-request context.
+            part_times: seconds per medium name.
+
+        """
+        return
+
     @abstractmethod
     def prepare_store(
         self,
@@ -802,6 +820,8 @@ class TransferResult:
     success: bool
     transfer_size: int | None = None
     transfer_time: float | None = None
+    # A load from several media: seconds each one took, by medium name.
+    part_times: dict[str, float] | None = None
 
 
 class OffloadingWorker(ABC):
