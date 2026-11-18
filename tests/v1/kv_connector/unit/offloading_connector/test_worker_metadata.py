@@ -65,3 +65,15 @@ def test_aggregate_keeps_failed_jobs_of_every_worker():
 
     assert result.completed_jobs == {42: 2, 7: 2}
     assert result.failed_jobs == {42, 7}
+
+
+def test_aggregate_keeps_the_slowest_part_times():
+    meta1 = OffloadingWorkerMetadata()
+    meta1.mark_completed(42, part_times={"cpu": 0.02, "obj": 0.05})
+    meta2 = OffloadingWorkerMetadata()
+    meta2.mark_completed(42, part_times={"cpu": 0.03})
+    meta2.mark_completed(7)
+
+    result = meta1.aggregate(meta2)
+
+    assert result.part_times == {42: {"cpu": 0.03, "obj": 0.05}}

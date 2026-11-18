@@ -5220,6 +5220,26 @@ def test_failed_load_marks_its_chunks_failed(request_runner, async_scheduling: b
 
     runner.manager.mark_load_failed.assert_called_once()
     assert len(runner.manager.mark_load_failed.call_args.args[0]) == 3
+    runner.manager.record_load_times.assert_not_called()
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_load_part_times_reach_the_manager(request_runner, async_scheduling: bool):
+    """The seconds each medium took for a load, as its workers report them,
+    reach the manager with the load's keys before complete_load()."""
+    runner = _store_three_chunks(request_runner, async_scheduling)
+    runner.offloading_spec.handler.part_times = {"cpu": 0.01, "obj": 0.02}
+
+    runner.new_request(token_ids=[0] * 12 + [1])
+    runner.manager.lookup.side_effect = [LookupResult.HIT] * 3 + [
+        LookupResult.MISS
+    ] * 100
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(0, 1, 2))
+
+    runner.manager.record_load_times.assert_called_once()
+    keys, _, part_times = runner.manager.record_load_times.call_args.args
+    assert len(keys) == 3
+    assert part_times == {"cpu": 0.01, "obj": 0.02}
 
 
 @pytest.mark.parametrize("min_load_tokens,expected_loaded", [(16, ()), (8, (0, 1, 2))])

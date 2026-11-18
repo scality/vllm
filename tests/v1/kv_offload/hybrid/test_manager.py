@@ -15,7 +15,12 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.hybrid.common import HybridLoadStoreSpec
-from vllm.v1.kv_offload.hybrid.manager import HybridOffloadingManager, split_load
+from vllm.v1.kv_offload.hybrid.manager import (
+    HybridOffloadingManager,
+    shared_from_obj_at_share,
+    split_load,
+)
+from vllm.v1.kv_offload.hybrid.split import LoadTimeModel
 from vllm.v1.kv_offload.obj.manager import ObjOffloadingManager
 
 pytestmark = pytest.mark.cpu_test
@@ -25,7 +30,7 @@ def _key(i: int) -> OffloadKey:
     return make_offload_key(i.to_bytes(8, "big"), 0)
 
 
-def _make_manager(num_cpu_chunks: int, obj_share: float = 0.5):
+def _make_manager(num_cpu_chunks: int, obj_share: float | None = 0.5, clock=None):
     file_mapper = MagicMock()
     file_mapper.get_file_name.side_effect = lambda key: key.hex()
     client = MagicMock()
@@ -34,7 +39,15 @@ def _make_manager(num_cpu_chunks: int, obj_share: float = 0.5):
         file_mapper=file_mapper, client=client, max_inflight_store_chunks=8
     )
     cpu = CPUOffloadingManager(num_chunks=num_cpu_chunks)
-    return HybridOffloadingManager(cpu, obj, obj_share)
+    # Host memory 1 ms + 1 ms per chunk, the object store 10 ms + 1 ms.
+    return HybridOffloadingManager(
+        cpu,
+        obj,
+        LoadTimeModel(latency=0.001, per_chunk=0.001),
+        LoadTimeModel(latency=0.010, per_chunk=0.001),
+        obj_share,
+        **({"clock": clock} if clock else {}),
+    )
 
 
 @pytest.fixture
@@ -77,8 +90,12 @@ def _store(manager: HybridOffloadingManager, keys, ctx) -> HybridLoadStoreSpec:
         ([1, 1], [1, 1], 1.0, [1, 1]),
     ],
 )
-def test_split_load(in_cpu, in_obj, share, expected):
-    from_obj = split_load([bool(c) for c in in_cpu], [bool(o) for o in in_obj], share)
+def test_split_load_at_a_share(in_cpu, in_obj, share, expected):
+    in_cpu = [bool(c) for c in in_cpu]
+    in_obj = [bool(o) for o in in_obj]
+    from_obj = split_load(
+        in_cpu, in_obj, shared_from_obj_at_share(in_cpu, in_obj, share)
+    )
     assert from_obj == [bool(e) for e in expected]
 
 
@@ -169,3 +186,29 @@ def test_chunks_of_a_failed_load_are_stored_to_both(make_manager, ctx):
 
     spec = _store(manager, keys, ctx)
     assert spec.cpu_chunks == [0] and spec.obj_chunks == [0]
+
+
+def test_measured_load_times_move_the_split(make_manager, ctx):
+    now = [0.0]
+    manager = make_manager(num_cpu_chunks=64, obj_share=None, clock=lambda: now[0])
+    keys = [_key(i) for i in range(40)]
+    for start in range(0, 40, 8):
+        _store(manager, keys[start : start + 8], ctx)
+
+    # 1 ms + (40 - x) ms == 10 ms + x ms
+    load = manager.prepare_load(keys, ctx)
+    assert len(load.obj_chunks) in (15, 16)
+    manager.complete_load(keys, ctx)
+
+    # The object store turns out much slower than expected.
+    for _ in range(20):
+        now[0] += 1
+        load = manager.prepare_load(keys, ctx)
+        n_cpu, n_obj = len(load.cpu_chunks), len(load.obj_chunks)
+        manager.record_load_times(
+            keys, ctx, {"cpu": 0.001 + 0.001 * n_cpu, "obj": 0.050 + 0.004 * n_obj}
+        )
+        manager.complete_load(keys, ctx)
+    load = manager.prepare_load(keys, ctx)
+    assert len(load.obj_chunks) < 8
+    manager.complete_load(keys, ctx)

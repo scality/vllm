@@ -86,18 +86,28 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
     (load or store). aggregate() sums counts across workers within a step.
     The scheduler accumulates across steps and processes
     a transfer completion only when count reaches num_workers.
-    A job in failed_jobs failed on at least one worker.
+    A job in failed_jobs failed on at least one worker. part_times holds, for
+    jobs whose workers timed each medium, the slowest worker's seconds per
+    medium.
     """
 
     completed_jobs: dict[int, int] = field(default_factory=dict)
     transfer_stats: TransferStats = field(default_factory=TransferStats)
     failed_jobs: set[int] = field(default_factory=set)
+    part_times: dict[int, dict[str, float]] = field(default_factory=dict)
 
-    def mark_completed(self, job_id: int, success: bool = True) -> None:
+    def mark_completed(
+        self,
+        job_id: int,
+        success: bool = True,
+        part_times: dict[str, float] | None = None,
+    ) -> None:
         """Record a transfer job completion from this worker."""
         self.completed_jobs[job_id] = 1
         if not success:
             self.failed_jobs.add(job_id)
+        if part_times:
+            self.part_times[job_id] = dict(part_times)
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -108,8 +118,19 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
         for job_id, v in other.completed_jobs.items():
             merged[job_id] = merged.get(job_id, 0) + v
 
+        part_times = {job_id: dict(t) for job_id, t in self.part_times.items()}
+        for job_id, times in other.part_times.items():
+            merge_part_times(part_times.setdefault(job_id, {}), times)
+
         return OffloadingWorkerMetadata(
             completed_jobs=merged,
             transfer_stats=self.transfer_stats.aggregate(other.transfer_stats),
             failed_jobs=self.failed_jobs | other.failed_jobs,
+            part_times=part_times,
         )
+
+
+def merge_part_times(into: dict[str, float], times: dict[str, float]) -> None:
+    """Keep the slowest time per medium: a job ends when all workers do."""
+    for medium, seconds in times.items():
+        into[medium] = max(into.get(medium, 0.0), seconds)

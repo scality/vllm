@@ -4,13 +4,16 @@
 
 Every chunk a request computes is stored to both. A load reads the chunks host
 memory holds from there and the others from the object store; when both hold
-enough of them, the load is split so that both finish together. Chunks a
+enough of them, the load is split so that both finish together, as the load
+times measured so far predict (see split.py). Chunks a
 request loaded or found in the GPU prefix cache are stored to host memory if
 it lacks them, so that later loads on this server can be split.
 """
 
-from collections.abc import Collection, Iterable
+import time
+from collections.abc import Callable, Collection, Iterable
 
+from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     LookupResult,
     OffloadingEvent,
@@ -25,24 +28,34 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.hybrid.common import HybridLoadStoreSpec
+from vllm.v1.kv_offload.hybrid.split import LoadTimeModel, shared_chunks_from_obj
 from vllm.v1.kv_offload.obj.common import ObjLoadStoreSpec
 from vllm.v1.kv_offload.obj.manager import ObjOffloadingManager
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
+logger = init_logger(__name__)
 
-def split_load(in_cpu: list[bool], in_obj: list[bool], obj_share: float) -> list[bool]:
-    """Which chunks of a load to read from the object store.
 
-    Chunks host memory lacks come from the object store. Of those both hold,
-    the last ones go to the object store too, until it reads obj_share of the
-    chunks, or as close as the others allow.
-    """
+def split_load(
+    in_cpu: list[bool], in_obj: list[bool], shared_from_obj: int
+) -> list[bool]:
+    """Which chunks of a load to read from the object store: those host memory
+    lacks, and the last shared_from_obj of those both hold."""
     from_obj = [not cpu for cpu in in_cpu]
     both = [i for i, (cpu, obj) in enumerate(zip(in_cpu, in_obj)) if cpu and obj]
-    extra = round(len(in_cpu) * obj_share) - sum(from_obj)
-    for i in both[len(both) - min(max(extra, 0), len(both)) :]:
+    for i in both[len(both) - shared_from_obj :] if shared_from_obj else ():
         from_obj[i] = True
     return from_obj
+
+
+def shared_from_obj_at_share(
+    in_cpu: list[bool], in_obj: list[bool], obj_share: float
+) -> int:
+    """How many chunks both hold to read from the object store for it to read
+    obj_share of the load, or as close as the others allow."""
+    shared = sum(cpu and obj for cpu, obj in zip(in_cpu, in_obj))
+    wanted = round(len(in_cpu) * obj_share) - in_cpu.count(False)
+    return min(max(wanted, 0), shared)
 
 
 class HybridOffloadingManager(OffloadingManager):
@@ -50,18 +63,31 @@ class HybridOffloadingManager(OffloadingManager):
         self,
         cpu: CPUOffloadingManager,
         obj: ObjOffloadingManager,
-        obj_load_share: float,
+        cpu_load_time: LoadTimeModel,
+        obj_load_time: LoadTimeModel,
+        obj_load_share: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ):
         """Args:
         cpu: Tracks the chunks in host memory.
         obj: Tracks the chunks in the object store.
-        obj_load_share: Fraction of the chunks of a load read from the
-            object store when host memory holds them too.
+        cpu_load_time: Load times from host memory, updated by
+            record_load_times().
+        obj_load_time: Load times from the object store, likewise.
+        obj_load_share: If set, the object store reads this fraction of the
+            chunks of a load when host memory holds them too, whatever the
+            load times; if None, the load times decide.
+        clock: Time source of the load time models.
 
         """
         self._cpu = cpu
         self._obj = obj
+        self._load_time = {"cpu": cpu_load_time, "obj": obj_load_time}
         self._obj_load_share = obj_load_share
+        self._clock = clock
+        # Chunks of each request's load read from host memory and the object
+        # store: a request loads once at a time.
+        self._load_sizes: dict[str, tuple[int, int]] = {}
         # Chunks of a request's load read from host memory: a request loads
         # once at a time.
         self._cpu_loads: dict[str, list[OffloadKey]] = {}
@@ -96,16 +122,15 @@ class HybridOffloadingManager(OffloadingManager):
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> HybridLoadStoreSpec:
         keys = list(keys)
-        from_obj = split_load(
-            [self._in_cpu(key, req_context) for key in keys],
-            [self._obj.holds(key) for key in keys],
-            self._obj_load_share,
-        )
+        in_cpu = [self._in_cpu(key, req_context) for key in keys]
+        in_obj = [self._obj.holds(key) for key in keys]
+        from_obj = split_load(in_cpu, in_obj, self._shared_from_obj(in_cpu, in_obj))
         cpu_chunks = [i for i, obj in enumerate(from_obj) if not obj]
         obj_chunks = [i for i, obj in enumerate(from_obj) if obj]
         cpu_keys = [keys[i] for i in cpu_chunks]
         obj_keys = [keys[i] for i in obj_chunks]
         req_id = req_context.req_id
+        self._load_sizes[req_id] = (len(cpu_keys), len(obj_keys))
         self._loaded.setdefault(req_id, set()).update(keys)
         cpu_spec = CPULoadStoreSpec([])
         if cpu_keys:
@@ -125,6 +150,50 @@ class HybridOffloadingManager(OffloadingManager):
         )
         return HybridLoadStoreSpec(cpu_chunks, cpu_spec, obj_chunks, obj_spec)
 
+    def _shared_from_obj(self, in_cpu: list[bool], in_obj: list[bool]) -> int:
+        shared = sum(cpu and obj for cpu, obj in zip(in_cpu, in_obj))
+        obj_only = in_cpu.count(False)
+        if not shared:
+            return 0
+        if self._obj_load_share is not None:
+            return shared_from_obj_at_share(in_cpu, in_obj, self._obj_load_share)
+        now = self._clock()
+        for model in self._load_time.values():
+            model.refresh(now)
+        cpu, obj = self._load_time["cpu"], self._load_time["obj"]
+        cpu_only = len(in_cpu) - obj_only - shared
+        from_obj = shared_chunks_from_obj(cpu_only, obj_only, shared, cpu, obj)
+        logger.debug(
+            "Load of %d chunks: %d of %d shared from the object store; host "
+            "%.1f ms + %.3f ms/chunk x %.2f shared, object store %.1f ms + "
+            "%.3f ms/chunk x %.2f shared",
+            len(in_cpu),
+            from_obj,
+            shared,
+            cpu.latency * 1e3,
+            cpu.per_chunk * 1e3,
+            cpu.contention,
+            obj.latency * 1e3,
+            obj.per_chunk * 1e3,
+            obj.contention,
+        )
+        return from_obj
+
+    def record_load_times(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+        part_times: dict[str, float],
+    ) -> None:
+        sizes = self._load_sizes.get(req_context.req_id)
+        if sizes is None:
+            return
+        now = self._clock()
+        alone = not all(sizes)
+        for medium, chunks in zip(("cpu", "obj"), sizes):
+            if medium in part_times:
+                self._load_time[medium].observe(chunks, part_times[medium], now, alone)
+
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
         self._cpu.touch(keys, req_context)
 
@@ -137,6 +206,7 @@ class HybridOffloadingManager(OffloadingManager):
     def complete_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> None:
+        self._load_sizes.pop(req_context.req_id, None)
         cpu_keys = self._cpu_loads.pop(req_context.req_id, None)
         if cpu_keys:
             self._cpu.complete_load(cpu_keys, req_context)
@@ -232,6 +302,7 @@ class HybridOffloadingManager(OffloadingManager):
     def reset_cache(self) -> None:
         self._cpu.reset_cache()
         self._obj.reset_cache()
+        self._load_sizes.clear()
         self._cpu_loads.clear()
         self._obj_loads.clear()
         self._loaded.clear()

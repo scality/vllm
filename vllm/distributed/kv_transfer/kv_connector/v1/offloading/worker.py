@@ -311,7 +311,9 @@ class OffloadingConnectorWorker:
                     transfer_result.transfer_time,
                 )
 
-            self._connector_worker_meta.mark_completed(job_id, transfer_result.success)
+            self._connector_worker_meta.mark_completed(
+                job_id, transfer_result.success, transfer_result.part_times
+            )
             req_id = self._load_jobs.pop(job_id, None)
             if req_id is None:
                 continue
