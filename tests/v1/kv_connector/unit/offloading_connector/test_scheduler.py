@@ -7413,6 +7413,61 @@ def test_ring_notify_counts_what_the_manager_knows_to_be_shared(request_runner):
     del scheduler._jobs[12345]
 
 
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_ring_wait_streams_chunks_the_manager_expects(
+    request_runner, async_scheduling: bool
+):
+    """A ring_wait request whose missing chunks the manager expects is
+    scheduled at once and loads each chunk as it is stored, rather than
+    waiting for all of them."""
+    runner = _store_three_chunks(request_runner, async_scheduling)
+    manager = runner.manager
+    available: list[OffloadKey] = []
+    expected: list[OffloadKey] = []
+    reserved: list[OffloadKey] = []
+
+    def lookup(key, req_context):
+        if not available:
+            available.append(key)  # the first chunk is already stored
+        if key in available:
+            return LookupResult.HIT
+        return LookupResult.HIT_PENDING if key in expected else LookupResult.MISS
+
+    def expect_stored(keys, req_context, deadline):
+        expected.extend(k for k in keys if k not in expected)
+        return True
+
+    def reserve_load(keys, req_context):
+        reserved.extend(keys)
+        return MockLoadStoreSpec(keys)
+
+    def take():
+        # One more expected chunk is stored at each step.
+        if not expected:
+            return [], []
+        key = expected.pop(0)
+        available.append(key)
+        return [key], []
+
+    manager.lookup.side_effect = lookup
+    manager.expect_stored.side_effect = expect_stored
+    manager.is_promotion_pending.side_effect = lambda key: key in expected
+    manager.reserve_load.side_effect = reserve_load
+    manager.take_promotion_results.side_effect = take
+
+    runner.new_request(
+        token_ids=[0] * 12 + [1],
+        kv_transfer_params={"ring_wait": {"num_tokens": 13, "timeout_ms": 60000}},
+    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(0, 1, 2))
+
+    manager.expect_stored.assert_called_once()
+    assert len(manager.expect_stored.call_args.args[0]) == 2
+    pieces = [src.offload_keys for src in _load_jobs(runner)]
+    assert len(pieces) > 1 and [k for p in pieces for k in p] == reserved
+    manager.cancel_reserved_load.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "notify, chunks_stored_before, chunks_stored_at",
     [

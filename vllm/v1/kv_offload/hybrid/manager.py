@@ -85,13 +85,16 @@ class HybridOffloadingManager(OffloadingManager):
         self._load_time = {"cpu": cpu_load_time, "obj": obj_load_time}
         self._obj_load_share = obj_load_share
         self._clock = clock
-        # Chunks of each request's load read from host memory and the object
-        # store: a request loads once at a time.
-        self._load_sizes: dict[str, tuple[int, int]] = {}
-        # Chunks of a request's load read from host memory: a request loads
-        # once at a time.
-        self._cpu_loads: dict[str, list[OffloadKey]] = {}
-        self._obj_loads: dict[str, list[OffloadKey]] = {}
+        # Chunks of each request's load still to complete, by the medium they
+        # are read from: a load may complete in pieces.
+        self._cpu_loads: dict[str, set[OffloadKey]] = {}
+        self._obj_loads: dict[str, set[OffloadKey]] = {}
+        # Chunks another instance is storing that a load waits for, with the
+        # request and the deadline; those that arrived or did not since the
+        # last take_promotion_results().
+        self._expected: dict[OffloadKey, tuple[ReqContext, float]] = {}
+        self._arrived: list[OffloadKey] = []
+        self._missed: list[OffloadKey] = []
         # Chunks each request loaded, which go back to host memory only.
         self._loaded: dict[str, set[OffloadKey]] = {}
         self._cpu_storing: set[OffloadKey] = set()
@@ -101,6 +104,8 @@ class HybridOffloadingManager(OffloadingManager):
         return self._cpu.lookup(key, req_context) is LookupResult.HIT
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        if key in self._expected:
+            return LookupResult.HIT_PENDING
         result = self._cpu.lookup(key, req_context)
         if result is not LookupResult.MISS:
             return result
@@ -134,16 +139,15 @@ class HybridOffloadingManager(OffloadingManager):
         cpu_keys = [keys[i] for i in cpu_chunks]
         obj_keys = [keys[i] for i in obj_chunks]
         req_id = req_context.req_id
-        self._load_sizes[req_id] = (len(cpu_keys), len(obj_keys))
         self._loaded.setdefault(req_id, set()).update(keys)
         cpu_spec = CPULoadStoreSpec([])
         if cpu_keys:
             spec = self._cpu.prepare_load(cpu_keys, req_context)
             assert isinstance(spec, CPULoadStoreSpec)
             cpu_spec = spec
-            self._cpu_loads[req_id] = cpu_keys
+            self._cpu_loads.setdefault(req_id, set()).update(cpu_keys)
         if obj_keys:
-            self._obj_loads[req_id] = obj_keys
+            self._obj_loads.setdefault(req_id, set()).update(obj_keys)
         # Chunks host memory holds stay as recent there as if read from it.
         moved = [key for key in obj_keys if self._in_cpu(key, req_context)]
         if moved:
@@ -190,9 +194,11 @@ class HybridOffloadingManager(OffloadingManager):
         req_context: ReqContext,
         part_times: dict[str, float],
     ) -> None:
-        sizes = self._load_sizes.get(req_context.req_id)
-        if sizes is None:
-            return
+        req_id = req_context.req_id
+        sizes = (
+            len(self._cpu_loads.get(req_id, set()).intersection(keys)),
+            len(self._obj_loads.get(req_id, set()).intersection(keys)),
+        )
         now = self._clock()
         alone = not all(sizes)
         for medium, chunks in zip(("cpu", "obj"), sizes):
@@ -208,14 +214,78 @@ class HybridOffloadingManager(OffloadingManager):
     def complete_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> None:
-        self._load_sizes.pop(req_context.req_id, None)
-        cpu_keys = self._cpu_loads.pop(req_context.req_id, None)
+        req_id = req_context.req_id
+        cpu_keys = self._take(self._cpu_loads, req_id, keys)
         if cpu_keys:
             self._cpu.complete_load(cpu_keys, req_context)
-        obj_keys = self._obj_loads.pop(req_context.req_id, None)
+        obj_keys = self._take(self._obj_loads, req_id, keys)
         if obj_keys:
             # Undone by mark_load_failed() if the load failed.
             self._obj.note_loaded(obj_keys)
+
+    @staticmethod
+    def _take(
+        loads: dict[str, set[OffloadKey]], req_id: str, keys: Collection[OffloadKey]
+    ) -> list[OffloadKey]:
+        pending = loads.get(req_id)
+        if not pending:
+            return []
+        taken = [key for key in keys if key in pending]
+        pending.difference_update(taken)
+        if not pending:
+            del loads[req_id]
+        return taken
+
+    def expect_stored(
+        self, keys: Collection[OffloadKey], req_context: ReqContext, deadline: float
+    ) -> bool:
+        for key in keys:
+            if key not in self._expected and not self._obj.in_store(key):
+                self._expected[key] = (req_context, deadline)
+        return True
+
+    def is_promotion_pending(self, key: OffloadKey) -> bool:
+        return key in self._expected
+
+    def reserve_load(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> HybridLoadStoreSpec:
+        # Expected chunks are in no host memory: they load from the store.
+        return self.prepare_load(keys, req_context)
+
+    def cancel_reserved_load(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        for key in keys:
+            self._expected.pop(key, None)
+        self._take(self._obj_loads, req_context.req_id, keys)
+
+    def take_promotion_results(
+        self,
+    ) -> tuple[list[OffloadKey], list[OffloadKey]]:
+        arrived, missed = self._arrived, self._missed
+        self._arrived, self._missed = [], []
+        return arrived, missed
+
+    def _poll_expected(self) -> None:
+        """Ask the store about expected chunks; those found arrived, those
+        past their deadline are missed."""
+        now = self._clock()
+        requery: dict[str, tuple[ReqContext, list[OffloadKey]]] = {}
+        for key, (req_context, deadline) in list(self._expected.items()):
+            found = self._obj.lookup(key, req_context)
+            if found is LookupResult.HIT:
+                self._arrived.append(key)
+            elif now >= deadline:
+                self._missed.append(key)
+            else:
+                if found is LookupResult.MISS:
+                    entry = requery.setdefault(req_context.req_id, (req_context, []))
+                    entry[1].append(key)
+                continue
+            del self._expected[key]
+        for req_context, keys in requery.values():
+            self._obj.requery_misses(keys, req_context)
 
     def mark_load_failed(
         self, keys: Collection[OffloadKey], req_context: ReqContext
@@ -296,17 +366,25 @@ class HybridOffloadingManager(OffloadingManager):
 
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
         self._cpu.on_schedule_end(context)
+        if self._expected:
+            self._poll_expected()
         self._obj.on_schedule_end(context)
 
     def has_pending_work(self) -> bool:
-        return self._cpu.has_pending_work() or self._obj.has_pending_work()
+        return (
+            bool(self._expected)
+            or self._cpu.has_pending_work()
+            or self._obj.has_pending_work()
+        )
 
     def reset_cache(self) -> None:
         self._cpu.reset_cache()
         self._obj.reset_cache()
-        self._load_sizes.clear()
         self._cpu_loads.clear()
         self._obj_loads.clear()
+        self._expected.clear()
+        self._arrived.clear()
+        self._missed.clear()
         self._loaded.clear()
         self._cpu_storing.clear()
         self._obj_storing.clear()

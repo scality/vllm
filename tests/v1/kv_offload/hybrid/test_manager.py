@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """HybridOffloadingManager over a CPU manager and an in-memory object store."""
 
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -11,6 +12,7 @@ from vllm.v1.kv_offload.base import (
     OffloadKey,
     OffloadPolicy,
     ReqContext,
+    ScheduleEndContext,
     make_offload_key,
 )
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
@@ -30,11 +32,18 @@ def _key(i: int) -> OffloadKey:
     return make_offload_key(i.to_bytes(8, "big"), 0)
 
 
-def _make_manager(num_cpu_chunks: int, obj_share: float | None = 0.5, clock=None):
+def _make_manager(
+    num_cpu_chunks: int,
+    obj_share: float | None = 0.5,
+    clock=None,
+    ring: set[str] | None = None,
+):
     file_mapper = MagicMock()
     file_mapper.get_file_name.side_effect = lambda key: key.hex()
     client = MagicMock()
-    client.query_existence.side_effect = lambda names: [False for _ in names]
+    # Object names the store holds, as another instance stores them.
+    ring = set() if ring is None else ring
+    client.query_existence.side_effect = lambda names: [n in ring for n in names]
     obj = ObjOffloadingManager(
         file_mapper=file_mapper, client=client, max_inflight_store_chunks=8
     )
@@ -221,3 +230,64 @@ def test_only_the_object_store_makes_chunks_shared(make_manager, ctx):
     assert not manager.shared_holds(_key(0))  # still being stored
     manager.complete_store(out.keys_to_store, ctx)
     assert manager.shared_holds(_key(0))
+
+
+_STEP = ScheduleEndContext(new_req_ids=(), preempted_req_ids=())
+
+
+def _step_until(manager: HybridOffloadingManager, done) -> None:
+    deadline = time.monotonic() + 5
+    while not done():
+        assert time.monotonic() < deadline
+        manager.on_schedule_end(_STEP)
+        time.sleep(0.01)
+
+
+def test_expected_chunks_load_as_they_are_stored(make_manager, ctx):
+    """Chunks another instance is storing look up as pending, then arrive
+    one by one; a load can take them in pieces."""
+    ring: set[str] = set()
+    manager = make_manager(num_cpu_chunks=8, ring=ring)
+    keys = [_key(0), _key(1)]
+    assert manager.expect_stored(keys, ctx, deadline=time.monotonic() + 60)
+    assert manager.lookup(keys[0], ctx) is LookupResult.HIT_PENDING
+    assert manager.is_promotion_pending(keys[1])
+    assert manager.has_pending_work()
+
+    load = manager.reserve_load(keys, ctx)
+    assert load.obj_chunks == [0, 1]
+
+    arrived: list[OffloadKey] = []
+
+    def took_arrivals() -> bool:
+        arrived.extend(manager.take_promotion_results()[0])
+        return bool(arrived)
+
+    ring.add(keys[0].hex())
+    _step_until(manager, took_arrivals)
+    assert arrived == [keys[0]]
+    assert manager.is_promotion_pending(keys[1])
+
+    manager.complete_load([keys[0]], ctx)  # the first piece
+    assert manager.shared_holds(keys[0])
+
+    ring.add(keys[1].hex())
+    _step_until(manager, lambda: not manager.is_promotion_pending(keys[1]))
+    manager.complete_load([keys[1]], ctx)
+    assert not manager.has_pending_work()
+
+
+def test_expected_chunks_miss_at_their_deadline(make_manager, ctx):
+    now = [0.0]
+    manager = make_manager(num_cpu_chunks=8, clock=lambda: now[0])
+    key = _key(0)
+    manager.expect_stored([key], ctx, deadline=1.0)
+    manager.reserve_load([key], ctx)
+    manager.on_schedule_end(_STEP)
+    assert manager.take_promotion_results() == ([], [])
+
+    now[0] = 2.0
+    manager.on_schedule_end(_STEP)
+    assert manager.take_promotion_results() == ([], [key])
+    manager.cancel_reserved_load([key], ctx)
+    assert not manager.has_pending_work()

@@ -407,6 +407,9 @@ class RequestOffloadState:
     ring_wait_timeout: float = 0.0
     ring_wait_deadline: float | None = None
     ring_wait_next_requery: float = 0.0
+    # True once the manager expects the chunks still missing: the request
+    # then loads them as they arrive (a streaming load).
+    ring_wait_streaming: bool = False
     # ring_notify: where to report that the prompt, but its last
     # ring_notify_tokens_left tokens, is stored; None once reported.
     ring_notify_url: str | None = None
@@ -1678,7 +1681,18 @@ class OffloadingConnectorScheduler:
                         )
                     ]
                 )
-            self.manager.requery_misses(keys, req_status.req_context)
+            if (
+                self._stream_promoted_loads
+                and not req_status.ring_wait_streaming
+                and self.manager.expect_stored(
+                    keys, req_status.req_context, req_status.ring_wait_deadline
+                )
+            ):
+                # The chunks now look up as pending: next time, the request is
+                # scheduled and loads them as they are stored.
+                req_status.ring_wait_streaming = True
+            else:
+                self.manager.requery_misses(keys, req_status.req_context)
             req_status.ring_wait_next_requery = now + _RING_WAIT_REQUERY_INTERVAL
         return True
 
