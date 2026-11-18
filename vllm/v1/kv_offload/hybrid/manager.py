@@ -118,6 +118,10 @@ class HybridOffloadingManager(OffloadingManager):
     ) -> None:
         self._obj.requery_misses(keys, req_context)
 
+    def shared_holds(self, key: OffloadKey) -> bool:
+        # Host memory serves this instance only: the object store decides.
+        return self._obj.in_store(key)
+
     def prepare_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> HybridLoadStoreSpec:

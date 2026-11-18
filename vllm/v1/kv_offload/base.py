@@ -471,6 +471,12 @@ class OffloadingManager(ABC):
         storing them."""
         return
 
+    def shared_holds(self, key: OffloadKey) -> bool | None:
+        """Whether other instances can read this chunk from a store they
+        share with this one, as far as this manager knows; None if it does
+        not track that, so the caller judges by this instance's stores."""
+        return None
+
     def is_promotion_pending(self, key: OffloadKey) -> bool:
         """Whether a HIT_PENDING key is pending because it is being promoted
         from a lower tier, which reserve_load() can wait for."""
@@ -733,6 +739,12 @@ class OffloadingSpec(ABC):
         # speculative decoding (EAGLE/MTP) the GPU prefix cache leaves out its
         # last matched block, which this keeps from being loaded back.
         self.min_load_tokens: int = int(self.extra_config.get("min_load_tokens", 0))
+
+        # Hosts a request's kv_transfer_params.ring_notify may name ("host" or
+        # "host:port"); none by default, which disables ring_notify.
+        self.ring_notify_hosts: frozenset[str] = frozenset(
+            self.extra_config.get("ring_notify_hosts", ())
+        )
 
         self.tokens_per_block = tuple(group.tokens_per_block for group in config.groups)
         self.tokens_per_hash = config.cache.tokens_per_hash
