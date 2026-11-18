@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NIXL client moving fixed-size slots of local memory to and from objects."""
 
+import threading
 import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
@@ -113,6 +114,9 @@ class ObjStoreClient:
             )
         params = {**obj_config.to_nixl_params(), "num_threads": str(io_threads)}
         self._agent.create_backend(self.backend, params)
+        # Existence queries come from several threads (lookups, reuse
+        # notifications); concurrent ones on one agent fail or hang.
+        self._query_lock = threading.Lock()
 
         self._transfers: dict[int, _Transfer] = {}
         # Results awaiting the next poll(): submission-time failures and
@@ -189,7 +193,8 @@ class ObjStoreClient:
         descriptors = [
             (_PROBE_ADDR, _PROBE_LEN, _PROBE_DEV_ID, name) for name in obj_names
         ]
-        results = self._agent.query_memory(descriptors, self.backend, "OBJ")
+        with self._query_lock:
+            results = self._agent.query_memory(descriptors, self.backend, "OBJ")
         return [r is not None for r in results]
 
     def submit(
