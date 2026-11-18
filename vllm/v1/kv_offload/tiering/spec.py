@@ -385,12 +385,16 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             try:
                 # Create scheduler-side SharedOffloadRegion (rank=None) so the
                 # primary tier can eagerly create a memoryview over _base.
+                # The workers mapped the region when the engine initialized
+                # the KV caches, before it built this scheduler: the path can
+                # go now, so that no exit, even SIGKILL, leaks the file.
                 scheduler_mmap = SharedOffloadRegion(
                     engine_id=self._engine_id,
                     num_chunks=self.num_chunks,
                     rank=None,
                     kv_bytes_per_chunk=self.kv_bytes_per_chunk,
                     cpu_page_size=self.cpu_page_size_per_worker,
+                    unlink_when_mapped=True,
                 )
                 self._scheduler_mmap = scheduler_mmap
 

@@ -97,7 +97,13 @@ class SharedOffloadRegion:
         *,
         creator_memory_check: Callable[[int], None] | None = None,
         populate_only_on_creator: bool = False,
+        unlink_when_mapped: bool = False,
     ) -> None:
+        """Args:
+        unlink_when_mapped: The caller opens the file after every other
+            process has, so its path is unlinked once mapped, as with a
+            barrier. Ignored, with a warning, if this call creates it.
+        """
         if populate_only_on_creator and barrier is None:
             raise ValueError("Creator-only population requires a barrier.")
         self.page_size = mmap.PAGESIZE
@@ -199,6 +205,17 @@ class SharedOffloadRegion:
             if self._creator:
                 os.unlink(self.mmap_path)
                 self._creator = False
+                logger.info("Unlinked mmap file %s", self.mmap_path)
+        elif unlink_when_mapped:
+            if self._creator:
+                logger.warning(
+                    "Created mmap file %s although every other process should "
+                    "have opened it first; keeping its path",
+                    self.mmap_path,
+                )
+            else:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(self.mmap_path)
                 logger.info("Unlinked mmap file %s", self.mmap_path)
 
         self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
@@ -381,6 +398,8 @@ class SharedOffloadRegion:
             try:
                 os.unlink(self.mmap_path)
                 logger.info("Removed mmap file %s", self.mmap_path)
+            except FileNotFoundError:
+                pass  # unlinked by the process that opened it last
             except Exception:
                 logger.warning(
                     "Failed to unlink path %s", self.mmap_path, exc_info=True

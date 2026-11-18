@@ -487,6 +487,40 @@ def test_file_has_correct_size(iid):
         assert os.path.getsize(r.mmap_path) == 4 * PAGE_SIZE
 
 
+def _scheduler_region(engine_id: str) -> SharedOffloadRegion:
+    return SharedOffloadRegion(
+        engine_id=engine_id,
+        num_chunks=4,
+        rank=None,
+        kv_bytes_per_chunk=PAGE_SIZE,
+        cpu_page_size=PAGE_SIZE,
+        unlink_when_mapped=True,
+    )
+
+
+def test_last_opener_unlinks_the_path_and_keeps_sharing(iid):
+    """The scheduler opens the region after the workers: dropping the path
+    then leaks nothing whatever way the processes exit."""
+    with _region(iid) as worker:
+        scheduler = _scheduler_region(iid)
+        try:
+            assert not os.path.exists(worker.mmap_path)
+            worker.mmap_obj[0] = 42
+            assert scheduler.mmap_obj[0] == 42
+        finally:
+            scheduler.cleanup()
+
+
+def test_last_opener_keeps_a_path_it_created(iid):
+    """If the scheduler came first, the workers still need the path."""
+    scheduler = _scheduler_region(iid)
+    try:
+        assert os.path.exists(scheduler.mmap_path)
+    finally:
+        scheduler.cleanup()
+        _cleanup_file(scheduler.mmap_path)
+
+
 def test_madvise_success_selects_madvise_population(iid, monkeypatch):
     """A successful probe must keep using MADV_POPULATE_WRITE — the fallback
     helper must never be invoked on a kernel that accepts the advice.
