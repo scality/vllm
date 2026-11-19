@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from vllm.config import KVTransferConfig, VllmConfig
+from vllm.config.kv_transfer import KVCacheAccess
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
@@ -51,6 +52,9 @@ from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
+
+# Specs whose workers may share the KV cache with other workers' processes.
+_IPC_SHARING_SPECS = ("ObjOffloadingSpec", "HybridOffloadingSpec")
 
 
 class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
@@ -248,6 +252,18 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     def take_events(self) -> Iterable[KVCacheEvent]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.take_events()
+
+    @classmethod
+    def kv_cache_access(cls, kv_transfer_config: KVTransferConfig) -> KVCacheAccess:
+        # The object store specs, and CPU loads fanned out over NVLink, map
+        # other workers' KV caches through legacy CUDA IPC (obj/peers.py),
+        # which cannot export the extensible KV cache's driver-mapped memory.
+        extra_config = kv_transfer_config.kv_connector_extra_config
+        if extra_config.get("spec_name") in _IPC_SHARING_SPECS or extra_config.get(
+            "cpu_load_fanout"
+        ):
+            return KVCacheAccess.LEGACY_IPC
+        return KVCacheAccess.IN_PROCESS
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:

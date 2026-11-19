@@ -10,6 +10,7 @@ import torch
 
 from tests.v1.kv_connector.unit.offloading_connector.utils import MockOffloadingSpec
 from vllm.config import KVTransferConfig, ParallelConfig, VllmConfig
+from vllm.config.kv_transfer import KVCacheAccess
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
     build_offloading_config,
 )
@@ -1375,3 +1376,27 @@ def test_blocks_per_chunk_must_be_positive():
 
     with pytest.raises(ValueError, match="greater than 0"):
         build_offloading_config(config, _make_kv_cache_config())
+
+
+@pytest.mark.parametrize(
+    ("extra_config", "access"),
+    [
+        ({"spec_name": "CPUOffloadingSpec"}, KVCacheAccess.IN_PROCESS),
+        ({"spec_name": "TieringOffloadingSpec"}, KVCacheAccess.IN_PROCESS),
+        ({"spec_name": "ObjOffloadingSpec"}, KVCacheAccess.LEGACY_IPC),
+        ({"spec_name": "HybridOffloadingSpec"}, KVCacheAccess.LEGACY_IPC),
+        (
+            {"spec_name": "TieringOffloadingSpec", "cpu_load_fanout": True},
+            KVCacheAccess.LEGACY_IPC,
+        ),
+    ],
+)
+def test_ipc_sharing_specs_opt_out_of_the_extensible_kv_cache(extra_config, access):
+    """Specs that map other workers' KV caches through legacy CUDA IPC say
+    so, so that the KV cache is not driver-mapped memory IPC cannot export."""
+    transfer = KVTransferConfig(
+        kv_connector="OffloadingConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config=extra_config,
+    )
+    assert transfer.kv_cache_access() == access
