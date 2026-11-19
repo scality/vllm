@@ -570,7 +570,7 @@ class OffloadingManager(ABC):
     def expect_stored(
         self, keys: Collection[OffloadKey], req_context: ReqContext, deadline: float
     ) -> bool:
-        """Chunks another instance is storing, which a ring_wait request waits
+        """Chunks another instance is storing, which a wait_for_stored request waits
         for until deadline (time.monotonic()). A manager that returns True
         reports them HIT_PENDING with is_promotion_pending(), then each as
         promoted once it is stored or failed past the deadline, through
@@ -923,10 +923,10 @@ class OffloadingSpec(ABC):
         # last matched block, which this keeps from being loaded back.
         self.min_load_tokens: int = int(self.extra_config.get("min_load_tokens", 0))
 
-        # Hosts a request's kv_transfer_params.ring_notify may name ("host" or
-        # "host:port"); none by default, which disables ring_notify.
-        self.ring_notify_hosts: frozenset[str] = frozenset(
-            self.extra_config.get("ring_notify_hosts", ())
+        # Hosts a request's kv_transfer_params.notify_stored may name ("host" or
+        # "host:port"); none by default, which disables notify_stored.
+        self.notify_stored_hosts: frozenset[str] = frozenset(
+            self.extra_config.get("notify_stored_hosts", ())
         )
 
         self.tokens_per_block = tuple(group.tokens_per_block for group in config.groups)

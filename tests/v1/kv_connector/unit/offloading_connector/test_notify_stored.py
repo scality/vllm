@@ -6,15 +6,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from vllm.distributed.kv_transfer.kv_connector.v1.offloading.ring_notify import (
-    RingNotifier,
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.notify_stored import (
+    StoredNotifier,
 )
 
 pytestmark = pytest.mark.cpu_test
 
 
 def test_only_listed_hosts_are_notified():
-    notifier = RingNotifier(["proxy", "other:8100"])
+    notifier = StoredNotifier(["proxy", "other:8100"])
     assert notifier.allows("http://proxy/ready/1")
     assert notifier.allows("http://proxy:9000/ready/1")
     assert notifier.allows("http://other:8100/ready/1")
@@ -41,7 +41,7 @@ def test_notify_posts_the_payload():
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    notifier = RingNotifier(["127.0.0.1"])
+    notifier = StoredNotifier(["127.0.0.1"])
     try:
         url = f"http://127.0.0.1:{server.server_address[1]}/ready/7"
         assert notifier.notify(url, {"stored_tokens": 12})

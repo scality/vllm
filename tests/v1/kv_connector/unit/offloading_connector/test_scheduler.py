@@ -7166,7 +7166,7 @@ def test_failed_promotion_recomputes_the_request(
     assert not runner.connector_scheduler._streaming_loads
 
 
-def _ring_with(runner, num_available: int) -> list[OffloadKey]:
+def _stored_by_another_instance(runner, num_available: int) -> list[OffloadKey]:
     """Make the first num_available chunks of the next request hits; each
     requery_misses() makes one more chunk a hit, as another instance storing
     them would. Returns the keys made available so far, in chunk order."""
@@ -7193,17 +7193,19 @@ def _ring_with(runner, num_available: int) -> list[OffloadKey]:
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
-def test_ring_wait_defers_until_the_prompt_is_stored(
-    request_runner, async_scheduling: bool
+@pytest.mark.parametrize("num_tokens", [{"num_tokens": 13}, {}])
+def test_wait_for_stored_defers_until_the_prompt_is_stored(
+    request_runner, async_scheduling: bool, num_tokens: dict
 ):
-    """A ring_wait request waits for the chunks another instance is storing,
-    asking again about all the missing ones, then loads them all."""
+    """A wait_for_stored request waits for the chunks another instance is
+    storing (its whole prompt without num_tokens), asking again about all the
+    missing ones, then loads them all."""
     runner = _store_three_chunks(request_runner, async_scheduling)
-    _ring_with(runner, num_available=1)
+    _stored_by_another_instance(runner, num_available=1)
 
     runner.new_request(
         token_ids=[0] * 12 + [1],
-        kv_transfer_params={"ring_wait": {"num_tokens": 13, "timeout_ms": 60000}},
+        kv_transfer_params={"wait_for_stored": {**num_tokens, "timeout_ms": 60000}},
     )
     runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(0, 1, 2))
     # Each requery covers all the chunks still missing.
@@ -7212,16 +7214,18 @@ def test_ring_wait_defers_until_the_prompt_is_stored(
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
-def test_ring_wait_gives_up_at_its_timeout(request_runner, async_scheduling: bool):
-    """Past its timeout, a ring_wait request loads what it found and computes
+def test_wait_for_stored_gives_up_at_its_timeout(
+    request_runner, async_scheduling: bool
+):
+    """Past its timeout, a wait_for_stored request loads what it found and computes
     the rest."""
     runner = _store_three_chunks(request_runner, async_scheduling)
-    _ring_with(runner, num_available=1)
+    _stored_by_another_instance(runner, num_available=1)
     runner.manager.requery_misses.side_effect = None
 
     runner.new_request(
         token_ids=[0] * 12 + [1],
-        kv_transfer_params={"ring_wait": {"num_tokens": 13, "timeout_ms": 0}},
+        kv_transfer_params={"wait_for_stored": {"num_tokens": 13, "timeout_ms": 0}},
     )
     runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(0,))
 
@@ -7310,19 +7314,19 @@ def test_short_hits_are_computed_not_loaded(
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
-def test_ring_notify_reports_once_the_prompt_is_stored(
+def test_notify_stored_reports_once_the_prompt_is_stored(
     request_runner, async_scheduling: bool
 ):
-    """A prefill request's ring_notify goes out once, when the store holds what
-    a decode instance's ring_wait waits for: its prompt in whole chunks."""
+    """A prefill request's notify_stored goes out once, when the store holds what
+    a decode instance's wait_for_stored waits for: its prompt in whole chunks."""
     runner = request_runner(
         block_size=4,
         num_gpu_blocks=100,
         async_scheduling=async_scheduling,
-        extra_config_overrides={"ring_notify_hosts": ["proxy"]},
+        extra_config_overrides={"notify_stored_hosts": ["proxy"]},
     )
     notifier = MagicMock()
-    runner.connector_scheduler._ring_notifier = notifier
+    runner.connector_scheduler._stored_notifier = notifier
     runner.manager.prepare_store.side_effect = lambda keys, req_context: (
         generate_store_output(keys)
     )
@@ -7331,7 +7335,7 @@ def test_ring_notify_reports_once_the_prompt_is_stored(
     runner.new_request(
         token_ids=[0] * 12 + [1],
         kv_transfer_params={
-            "ring_notify": {"url": "http://proxy/ready/1", "tokens_left": 0}
+            "notify_stored": {"url": "http://proxy/ready/1", "tokens_left": 0}
         },
     )
     runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0, 1, 2))
@@ -7343,22 +7347,24 @@ def test_ring_notify_reports_once_the_prompt_is_stored(
     assert payload["num_prompt_tokens"] == 13
 
 
-def test_ring_notify_waits_for_the_stores(request_runner):
+def test_notify_stored_waits_for_the_stores(request_runner):
     """Chunks whose store is still in flight do not count as stored."""
     runner = request_runner(
         block_size=4,
         num_gpu_blocks=100,
         async_scheduling=False,
-        extra_config_overrides={"ring_notify_hosts": ["proxy"]},
+        extra_config_overrides={"notify_stored_hosts": ["proxy"]},
     )
     scheduler = runner.connector_scheduler
-    scheduler._ring_notifier = MagicMock()
+    scheduler._stored_notifier = MagicMock()
     runner.manager.prepare_store.side_effect = lambda keys, req_context: (
         generate_store_output(keys)
     )
     runner.new_request(
         token_ids=[0] * 12 + [1],
-        kv_transfer_params={"ring_notify": {"url": "http://proxy/r", "tokens_left": 4}},
+        kv_transfer_params={
+            "notify_stored": {"url": "http://proxy/r", "tokens_left": 4}
+        },
     )
     runner.manager.shared_holds.return_value = None
     req_status = next(iter(scheduler._req_status.values()))
@@ -7369,30 +7375,32 @@ def test_ring_notify_waits_for_the_stores(request_runner):
     scheduler._jobs[12345] = store_job
     req_status.transfer_jobs.add(12345)
 
-    assert scheduler._ring_stored_tokens(req_status) == 4
-    scheduler._maybe_ring_notify(req_status)  # 4 stored < 12 - 4
-    scheduler._ring_notifier.notify.assert_not_called()
+    assert scheduler._shared_stored_tokens(req_status) == 4
+    scheduler._maybe_notify_stored(req_status)  # 4 stored < 12 - 4
+    scheduler._stored_notifier.notify.assert_not_called()
 
     req_status.transfer_jobs.discard(12345)
-    scheduler._maybe_ring_notify(req_status)
-    scheduler._ring_notifier.notify.assert_called_once()
+    scheduler._maybe_notify_stored(req_status)
+    scheduler._stored_notifier.notify.assert_called_once()
     del scheduler._jobs[12345]
 
 
-def test_ring_notify_counts_what_the_manager_knows_to_be_shared(request_runner):
+def test_notify_stored_counts_what_the_manager_knows_to_be_shared(request_runner):
     """A manager that knows which chunks other instances can read decides:
     stores to this instance's own media do not hold the notify back."""
     runner = request_runner(
         block_size=4,
         num_gpu_blocks=100,
         async_scheduling=False,
-        extra_config_overrides={"ring_notify_hosts": ["proxy"]},
+        extra_config_overrides={"notify_stored_hosts": ["proxy"]},
     )
     scheduler = runner.connector_scheduler
-    scheduler._ring_notifier = MagicMock()
+    scheduler._stored_notifier = MagicMock()
     runner.new_request(
         token_ids=[0] * 12 + [1],
-        kv_transfer_params={"ring_notify": {"url": "http://proxy/r", "tokens_left": 0}},
+        kv_transfer_params={
+            "notify_stored": {"url": "http://proxy/r", "tokens_left": 0}
+        },
     )
     req_status = next(iter(scheduler._req_status.values()))
     req_status.update_offload_keys()
@@ -7402,22 +7410,22 @@ def test_ring_notify_counts_what_the_manager_knows_to_be_shared(request_runner):
     scheduler._jobs[12345] = store_job
     req_status.transfer_jobs.add(12345)
 
-    assert scheduler._ring_stored_tokens(req_status) == 8
-    scheduler._maybe_ring_notify(req_status)
-    scheduler._ring_notifier.notify.assert_not_called()
+    assert scheduler._shared_stored_tokens(req_status) == 8
+    scheduler._maybe_notify_stored(req_status)
+    scheduler._stored_notifier.notify.assert_not_called()
 
     runner.manager.shared_holds.side_effect = lambda key: True
-    scheduler._maybe_ring_notify(req_status)  # despite the store in flight
-    scheduler._ring_notifier.notify.assert_called_once()
+    scheduler._maybe_notify_stored(req_status)  # despite the store in flight
+    scheduler._stored_notifier.notify.assert_called_once()
     req_status.transfer_jobs.discard(12345)
     del scheduler._jobs[12345]
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
-def test_ring_wait_streams_chunks_the_manager_expects(
+def test_wait_for_stored_streams_chunks_the_manager_expects(
     request_runner, async_scheduling: bool
 ):
-    """A ring_wait request whose missing chunks the manager expects is
+    """A wait_for_stored request whose missing chunks the manager expects is
     scheduled at once and loads each chunk as it is stored, rather than
     waiting for all of them."""
     runner = _store_three_chunks(request_runner, async_scheduling)
@@ -7457,7 +7465,7 @@ def test_ring_wait_streams_chunks_the_manager_expects(
 
     runner.new_request(
         token_ids=[0] * 12 + [1],
-        kv_transfer_params={"ring_wait": {"num_tokens": 13, "timeout_ms": 60000}},
+        kv_transfer_params={"wait_for_stored": {"num_tokens": 13, "timeout_ms": 60000}},
     )
     runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(0, 1, 2))
 
@@ -7477,30 +7485,30 @@ def test_ring_wait_streams_chunks_the_manager_expects(
         ({"tokens_left": 100}, 0, 1),
     ],
 )
-def test_ring_notify_lead_is_a_share_of_the_prompt_capped(
+def test_notify_stored_lead_is_a_share_of_the_prompt_capped(
     request_runner, notify, chunks_stored_before: int, chunks_stored_at: int
 ):
     runner = request_runner(
         block_size=4,
         num_gpu_blocks=100,
         async_scheduling=False,
-        extra_config_overrides={"ring_notify_hosts": ["proxy"]},
+        extra_config_overrides={"notify_stored_hosts": ["proxy"]},
     )
     scheduler = runner.connector_scheduler
-    scheduler._ring_notifier = MagicMock()
+    scheduler._stored_notifier = MagicMock()
     runner.manager.shared_holds.return_value = None  # judge by the stores
     runner.new_request(
         token_ids=[0] * 12 + [1],
-        kv_transfer_params={"ring_notify": {"url": "http://proxy/r", **notify}},
+        kv_transfer_params={"notify_stored": {"url": "http://proxy/r", **notify}},
     )
     req_status = next(iter(scheduler._req_status.values()))
     req_status.update_offload_keys()
     group_state = req_status.group_states[0]
 
     group_state.next_stored_chunk_idx = chunks_stored_before
-    scheduler._maybe_ring_notify(req_status)
-    scheduler._ring_notifier.notify.assert_not_called()
+    scheduler._maybe_notify_stored(req_status)
+    scheduler._stored_notifier.notify.assert_not_called()
 
     group_state.next_stored_chunk_idx = chunks_stored_at
-    scheduler._maybe_ring_notify(req_status)
-    scheduler._ring_notifier.notify.assert_called_once()
+    scheduler._maybe_notify_stored(req_status)
+    scheduler._stored_notifier.notify.assert_called_once()
