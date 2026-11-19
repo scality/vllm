@@ -31,7 +31,7 @@ from vllm.v1.kv_offload.tiering.base import (
     SecondaryTierManager,
     TransferJob,
 )
-from vllm.v1.kv_offload.tiering.obj.config import ObjStoreConfig
+from vllm.v1.kv_offload.tiering.obj.config import S3_BACKEND, ObjStoreConfig
 
 if TYPE_CHECKING:
     from nixl._api import nixl_prepped_dlist_handle, nixl_xfer_handle
@@ -117,7 +117,9 @@ class ObjAsyncLookupManager(AsyncLookupManager):
             )
             for k in keys
         ]
-        results = self._tier._agent.query_memory(descriptors, "OBJ", "OBJ")
+        results = self._tier._agent.query_memory(
+            descriptors, self._tier._backend, "OBJ"
+        )
         return (r is not None for r in results)
 
 
@@ -185,8 +187,15 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         agent_config = nixl_agent_config(backends=[], capture_telemetry=True)
         self._agent = nixl_agent("ObjAgent", agent_config)
         obj_config = ObjStoreConfig(**store_config)
+        self._backend = obj_config.backend
+        if "OBJ_SEG" not in self._agent.get_plugin_mem_types(self._backend):
+            raise ValueError(
+                f"NIXL backend {self._backend!r} is not available or does not "
+                f"support object segments (OBJ_SEG). Available plugins: "
+                f"{', '.join(self._agent.get_plugin_list())}."
+            )
         params = {**obj_config.to_nixl_params(), "num_threads": str(io_threads)}
-        self._agent.create_backend("OBJ", params)
+        self._agent.create_backend(self._backend, params)
         self._transfers: dict[int, TransferEntry] = {}
         # Buffered results awaiting the next get_finished_jobs() call:
         # submission-time failures + poll-time completions accumulated
@@ -237,21 +246,27 @@ class ObjectStoreSecondaryTierManager(SecondaryTierManager):
         an exception indicates misconfigured obj store params and raises RuntimeError.
         """
         probe_key = "__nixl_probe__/connectivity_test"
+        if self._backend != S3_BACKEND:
+            hint = f"endpoint_override and backend_params of backend {self._backend}"
+        else:
+            hint = (
+                "bucket, endpoint_override, and scheme. If using explicit "
+                "credentials verify access_key and secret_key; otherwise ensure "
+                "the AWS SDK default credential chain is configured (IAM role, "
+                "env vars, credential file)"
+            )
         try:
             self._exists(probe_key)
             logger.info("Object store tier connectivity probe succeeded")
         except Exception as e:
             raise RuntimeError(
-                f"Object store tier connectivity probe failed — check bucket, "
-                f"endpoint_override, and scheme. If using explicit credentials "
-                f"verify access_key and secret_key; otherwise ensure the AWS "
-                f"SDK default credential chain is configured (IAM role, env "
-                f"vars, credential file). Error: {e}"
+                f"Object store tier connectivity probe failed — check {hint}. "
+                f"Error: {e}"
             ) from e
 
     def _exists(self, obj_key: str) -> bool:
         results = self._agent.query_memory(
-            [(_PROBE_ADDR, _PROBE_LEN, _PROBE_DEV_ID, obj_key)], "OBJ", "OBJ"
+            [(_PROBE_ADDR, _PROBE_LEN, _PROBE_DEV_ID, obj_key)], self._backend, "OBJ"
         )
         return results[0] is not None
 

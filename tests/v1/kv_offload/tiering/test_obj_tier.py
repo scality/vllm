@@ -155,11 +155,22 @@ class MockNixlAgent:
         self._handle_counter = 0
         self._last_obj_keys: list[str] = []
         self.created_backends: list[tuple[str, dict[str, str]]] = []
+        self.queried_backends: list[str] = []
         # Bind default implementations as instance attributes.
         self.register_memory = self._register_memory
         self.make_prepped_xfer = self._make_prepped_xfer
         self.check_xfer_state = self._check_xfer_state
         self.query_memory = self._query_memory
+
+    def get_plugin_list(self):
+        return ["OBJ", "REST", "POSIX"]
+
+    def get_plugin_mem_types(self, backend):
+        # Same strings as the real NIXL binding (nixlEnumStrings::memTypeStr).
+        return {
+            "OBJ": ["DRAM_SEG", "OBJ_SEG"],
+            "REST": ["DRAM_SEG", "VRAM_SEG", "OBJ_SEG"],
+        }.get(backend, ["DRAM_SEG", "FILE_SEG"])
 
     def create_backend(self, backend_type, params):
         self.created_backends.append((backend_type, params))
@@ -217,7 +228,8 @@ class MockNixlAgent:
             raise RuntimeError("Telemetry capture is disabled")
         return SimpleNamespace(xferDuration=1000)
 
-    def _query_memory(self, queries, mem_type, agent_name):
+    def _query_memory(self, queries, backend, mem_type):
+        self.queried_backends.append(backend)
         return [object() if q[3] in self._stored_obj_keys else None for q in queries]
 
 
@@ -1016,3 +1028,54 @@ def test_obj_tier_namespace_includes_blocks_per_chunk():
     finally:
         for tier in tiers:
             tier.shutdown()
+
+
+_REST_STORE_CONFIG = {
+    "backend": "REST",
+    "endpoint_override": "http://10.0.0.1:10000",
+}
+
+
+class TestObjStoreConfigOtherBackend:
+    def test_to_nixl_params(self):
+        cfg = ObjStoreConfig(
+            **_REST_STORE_CONFIG, backend_params={"rdma_nics": "mlx5_1,mlx5_2"}
+        )
+        assert cfg.to_nixl_params() == {
+            "endpoint_override": "http://10.0.0.1:10000",
+            "rdma_nics": "mlx5_1,mlx5_2",
+        }
+
+    def test_endpoint_optional(self):
+        cfg = ObjStoreConfig(backend="AZURE_BLOB", backend_params={"account": "a"})
+        assert cfg.to_nixl_params() == {"account": "a"}
+
+    def test_rejects_s3_fields(self):
+        with pytest.raises(ValueError, match="must not set"):
+            ObjStoreConfig(**_REST_STORE_CONFIG, bucket="b")
+
+    def test_s3_backend_requires_bucket(self):
+        with pytest.raises(ValueError, match="bucket"):
+            ObjStoreConfig(endpoint_override="ep")
+
+
+def test_rest_tier_uses_rest_backend():
+    """Backend creation and existence queries both target REST, not OBJ."""
+    tier, agent = _make_tier(num_blocks=4, store_config=_REST_STORE_CONFIG)
+    try:
+        assert [b for b, _ in agent.created_backends] == ["REST"]
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        assert all(r.success for r in drain(tier))
+        assert lookup_and_wait(tier, [key(1), key(2)]) == [
+            LookupResult.HIT,
+            LookupResult.MISS,
+        ]
+        assert set(agent.queried_backends) == {"REST"}
+    finally:
+        tier.shutdown()
+
+
+@pytest.mark.parametrize("backend", ["POSIX", "MISSING"])
+def test_backend_without_obj_segments_raises(backend):
+    with pytest.raises(ValueError, match="object segments"):
+        _make_tier(store_config={"backend": backend})

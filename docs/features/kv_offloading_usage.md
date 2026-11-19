@@ -295,8 +295,9 @@ The object-store tier (`type: "obj"`) offloads blocks to an S3-compatible object
 
 | Key | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `bucket` | yes | — | Bucket name. |
-| `endpoint_override` | yes | — | Object store endpoint host; the URL scheme is set separately via `scheme`. |
+| `backend` | no | `OBJ` | NIXL plugin name. See [Other object backends](#other-object-backends) for values other than `OBJ`. |
+| `bucket` | yes (`OBJ`) | — | Bucket name. |
+| `endpoint_override` | yes (`OBJ`) | — | Object store endpoint host; the URL scheme is set separately via `scheme`. |
 | `scheme` | no | `http` | `http` or `https`. |
 | `access_key`, `secret_key`, `session_token` | no | `""` | Explicit credentials. When left empty, the NIXL OBJ plugin falls back to the AWS SDK default credential provider chain (IAM roles, environment variables, credential files), which enables workload-identity auth on Kubernetes. |
 | `region` | no | `""` | Bucket region, if the endpoint requires one. |
@@ -314,6 +315,18 @@ For example, to enable the accelerated (S3-over-RDMA) object-store engine of a s
 ```
 
 `type` selects the vendor-specific accelerated engine registered in the NIXL OBJ plugin; which values are available depends on the installed NIXL release (`dell` is the engine shipped in NIXL 1.5.2). `accelerated` without a `type` initializes an accelerated client that still transfers over plain S3 on that release.
+
+#### Other object backends
+
+Set `backend` to any other NIXL plugin that exposes object segments (`OBJ_SEG`), such as `REST` (Scality AI Connector, HTTP control plane with an RDMA data plane) or `AZURE_BLOB`. The tier checks at startup that the plugin is available and supports object segments. Only `endpoint_override` (when set) and `backend_params` are passed to the plugin; the S3 fields (`bucket`, credentials, `region`, `ca_bundle`) are rejected. For example, with the `REST` plugin:
+
+```json
+"store_config": {
+  "backend": "REST",
+  "endpoint_override": "http://10.0.0.1:10000",
+  "backend_params": {"rdma_nics": "mlx5_1,mlx5_2"}
+}
+```
 
 Object keys follow the same run-configuration digest scheme as the filesystem tier (see [On-Disk Layout](#on-disk-layout)) and are stored under the optional `prefix`. The [Cross-Process Sharing](#cross-process-sharing) behavior applies to shared buckets as well, so instances sharing a bucket produce identical keys for identical content; set a shared `PYTHONHASHSEED` if you want a custom seed. At startup the tier probes object store connectivity and fails fast with a configuration error if the bucket is unreachable.
 
