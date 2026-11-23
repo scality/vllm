@@ -38,6 +38,7 @@ class FileMapper:
         parallel_agnostic: bool = False,
         replicated_layout: bool = False,
         canonical_format: str | None = None,
+        kv_layout_family: str | None = None,
     ):
         """Initialize the file mapper. Each worker constructs its own, but
         `config.json` is shared across workers since rank lives outside the hash.
@@ -71,6 +72,11 @@ class FileMapper:
         # identity participates in the storage namespace.
         if canonical_format is not None:
             self.fields["canonical_format"] = canonical_format
+        # The direct layout's bytes depend on the attention backend family:
+        # the CPU backends' pages differ from the GPU backends'. Only written
+        # when set so the GPU namespace is unchanged.
+        if kv_layout_family is not None:
+            self.fields["kv_layout_family"] = kv_layout_family
         self.base_path: str = self._compute_base_path(root_dir, self.fields)
 
     @classmethod
@@ -80,8 +86,11 @@ class FileMapper:
         offloading_spec: OffloadingSpec,
         blocks_per_file: int = 1,
         parallel_agnostic: bool = False,
+        kv_layout_family: str | None = None,
     ) -> "FileMapper":
-        """Build a FileMapper from an OffloadingSpec."""
+        """Build a FileMapper from an OffloadingSpec. kv_layout_family names
+        the backends whose direct-layout bytes differ from the GPU ones (e.g.
+        "cpu"); it is ignored with the canonical layout."""
         config = offloading_spec.config
         kv_cache_groups = [
             {
@@ -95,6 +104,7 @@ class FileMapper:
         if config.canonical_layout:
             assert config.kv_cache_layout is not None
             canonical_format = canonical_format_id(config.kv_cache_layout)
+            kv_layout_family = None
         return cls(
             root_dir=root_dir,
             model_name=config.model.name,
@@ -113,6 +123,7 @@ class FileMapper:
             ),
             replicated_layout=(parallel_agnostic and config.replicated_layout),
             canonical_format=canonical_format,
+            kv_layout_family=kv_layout_family,
         )
 
     def get_file_name(self, key: OffloadKey) -> str:

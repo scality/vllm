@@ -21,7 +21,9 @@ reads what the other wrote. kv_connector_extra_config:
         the Triton kernel whatever the page size (default "auto")
 
 Set kv_load_failure_policy to "recompute": a load fails when the store has
-evicted the chunk since it was looked up. With more than one worker, chunks
+evicted the chunk since it was looked up. On the CPU platform, the KV cache is
+in host memory and moves through a host staging buffer (ObjCpuOffloadingWorker),
+with one worker and the direct layout only. With more than one worker, chunks
 must not depend on the parallel configuration (see canonical_layout); each
 chunk then has one owner worker, which moves it for all: it gathers a chunk
 sharded across the workers through CUDA IPC, or stores its own copy of a
@@ -32,6 +34,7 @@ from typing import Any
 
 from typing_extensions import override
 
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
@@ -61,6 +64,12 @@ class ObjOffloadingSpec(OffloadingSpec):
     def __init__(self, config: OffloadingConfig):
         super().__init__(config)
         world_size = config.parallel.world_size
+        if current_platform.is_cpu() and (world_size != 1 or config.canonical_layout):
+            raise NotImplementedError(
+                "ObjOffloadingSpec on CPU supports one worker and the direct "
+                f"layout only (world_size={world_size}, canonical_layout="
+                f"{config.canonical_layout})"
+            )
         if world_size != 1 and not (
             config.replicated_layout or config.parallel.is_parallelism_agnostic
         ):
@@ -107,7 +116,10 @@ class ObjOffloadingSpec(OffloadingSpec):
         if self._manager is None:
             root_dir = f"{self.prefix}/" if self.prefix else ""
             file_mapper = FileMapper.from_offloading_spec(
-                root_dir, self, parallel_agnostic=True
+                root_dir,
+                self,
+                parallel_agnostic=True,
+                kv_layout_family="cpu" if current_platform.is_cpu() else None,
             )
             self._manager = ObjOffloadingManager(
                 file_mapper=file_mapper,
@@ -121,6 +133,21 @@ class ObjOffloadingSpec(OffloadingSpec):
 
     @override
     def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
+        if self._worker is None and current_platform.is_cpu():
+            from vllm.v1.kv_offload.obj.cpu_worker import ObjCpuOffloadingWorker
+
+            self._worker = ObjCpuOffloadingWorker(
+                kv_caches=kv_caches,
+                blocks_per_chunk=self.blocks_per_chunk,
+                chunk_bytes=self.chunk_bytes,
+                store_config=self.store_config,
+                io_threads=self.io_threads,
+                staging_bytes=self.staging_bytes,
+                agent_name="ObjWorkerAgent0",
+                piece_chunks=self.piece_chunks and int(self.piece_chunks),
+                max_inflight_gets=self.max_inflight_gets
+                and int(self.max_inflight_gets),
+            )
         if self._worker is None:
             from vllm.v1.kv_offload.obj.worker import ObjOffloadingWorker
 

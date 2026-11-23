@@ -21,6 +21,7 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.obj.client import NIXL_WRITE, ObjTransferResult
 from vllm.v1.kv_offload.obj.common import ObjLoadStoreSpec, owner_of
+from vllm.v1.kv_offload.obj.cpu_worker import ObjCpuOffloadingWorker
 from vllm.v1.kv_offload.obj.worker import ObjOffloadingWorker
 from vllm.v1.kv_offload.pointer_utils import (
     remap_device_pointers,
@@ -171,6 +172,11 @@ def test_every_chunk_has_one_owner_in_every_process():
     assert set(owners) == set(range(8))
 
 
+def _synchronize() -> None:
+    if torch.accelerator.is_available():
+        torch.accelerator.synchronize()
+
+
 class _FakeStore:
     """An object store holding objects in a dict, moving slots of the
     staging buffer synchronously."""
@@ -185,7 +191,7 @@ class _FakeStore:
 
     def submit(self, job_id, slot_ids, obj_names, op) -> None:
         assert self.staging is not None
-        torch.accelerator.synchronize()
+        _synchronize()
         success = True
         for slot, name in zip(slot_ids.tolist(), obj_names):
             if op == NIXL_WRITE:
@@ -194,7 +200,7 @@ class _FakeStore:
                 self.staging[slot].copy_(self.objects[name])
             else:
                 success = False
-        torch.accelerator.synchronize()
+        _synchronize()
         self._results.append(ObjTransferResult(job_id, success))
 
     def poll(self) -> list[ObjTransferResult]:
@@ -544,3 +550,118 @@ def test_one_block_chunks_take_the_fast_load_path(kv):
         assert torch.equal(kv[[7, 0, 5]], expected)
     finally:
         worker.shutdown()
+
+
+# CPU worker: the KV cache in host memory, two tensors of different page sizes.
+CPU_PAGES = (256, 128)
+CPU_CHUNK_BYTES = 1024
+
+
+@pytest.fixture
+def cpu_kv() -> list[torch.Tensor]:
+    gen = torch.Generator().manual_seed(0)
+    return [
+        torch.randint(-128, 127, (8, page), dtype=torch.int8, generator=gen)
+        for page in CPU_PAGES
+    ]
+
+
+def _cpu_kv_caches(kv: list[torch.Tensor]) -> CanonicalKVCaches:
+    return CanonicalKVCaches(
+        tensors=[CanonicalKVCacheTensor(t, page) for t, page in zip(kv, CPU_PAGES)],
+        group_data_refs=[[CanonicalKVCacheRef(i, p) for i, p in enumerate(CPU_PAGES)]],
+    )
+
+
+@pytest.fixture
+def cpu_worker(cpu_kv: list[torch.Tensor]):
+    with patch("vllm.v1.kv_offload.obj.cpu_worker.ObjStoreClient", _FakeStore):
+        worker = ObjCpuOffloadingWorker(
+            kv_caches=_cpu_kv_caches(cpu_kv),
+            blocks_per_chunk=BLOCKS_PER_CHUNK,
+            chunk_bytes=CPU_CHUNK_BYTES,
+            store_config={},
+            io_threads=1,
+            staging_bytes=CPU_CHUNK_BYTES,  # one slot: a job goes in pieces
+            agent_name="test",
+        )
+    worker._client.staging = worker._staging  # type: ignore[attr-defined]
+    yield worker
+    worker.shutdown()
+
+
+def _cpu_ptrs(
+    kv: list[torch.Tensor], block_ids: list[int], block_index: int = 0
+) -> DevicePointers:
+    spec = GPULoadStoreSpec(
+        block_ids, group_sizes=[len(block_ids)], block_indices=[block_index]
+    )
+    return resolve_device_pointers(spec, _cpu_kv_caches(kv))
+
+
+def _row(kv: list[torch.Tensor], blocks: list[int | None]) -> torch.Tensor:
+    """A CPU tier chunk row: each tensor's pages for the chunk's blocks, tensor
+    after tensor, then zero padding. None leaves a block's pages zero."""
+    parts = [
+        t[b] if b is not None else torch.zeros(page, dtype=torch.int8)
+        for t, page in zip(kv, CPU_PAGES)
+        for b in blocks
+    ]
+    row = torch.cat(parts)
+    return torch.cat([row, torch.zeros(CPU_CHUNK_BYTES - len(row), dtype=torch.int8)])
+
+
+@pytest.mark.cpu_test
+def test_cpu_objects_are_chunk_rows_and_load_back(cpu_worker, cpu_kv):
+    """Objects have the GPU worker's layout, so a load restores the blocks."""
+    names = ObjLoadStoreSpec(["a", "b"])
+    expected = [t[[2, 3, 4, 5]].clone() for t in cpu_kv]
+
+    cpu_worker.submit_store(1, _cpu_ptrs(cpu_kv, [2, 3, 4, 5]), names)
+    assert _finish(cpu_worker, 1).success
+    objects = cpu_worker._client.objects
+    assert torch.equal(objects["a"], _row(cpu_kv, [2, 3]))
+    assert torch.equal(objects["b"], _row(cpu_kv, [4, 5]))
+
+    for t in cpu_kv:
+        t.zero_()
+    cpu_worker.submit_load(2, names, _cpu_ptrs(cpu_kv, [6, 7, 0, 1]))
+    assert _finish(cpu_worker, 2).success
+    for t, exp in zip(cpu_kv, expected):
+        assert torch.equal(t[[6, 7, 0, 1]], exp)
+
+
+@pytest.mark.cpu_test
+def test_cpu_chunk_started_mid_way_keeps_block_offsets(cpu_worker, cpu_kv):
+    """A request whose first block is the second of its chunk stores that
+    block at the second position of the chunk's pages."""
+    cpu_worker.submit_store(
+        3, _cpu_ptrs(cpu_kv, [5, 6, 7], 1), ObjLoadStoreSpec(["c", "d"])
+    )
+
+    assert _finish(cpu_worker, 3).success
+    assert torch.equal(cpu_worker._client.objects["c"], _row(cpu_kv, [None, 5]))
+    assert torch.equal(cpu_worker._client.objects["d"], _row(cpu_kv, [6, 7]))
+
+
+@pytest.mark.cpu_test
+def test_cpu_load_of_a_missing_object_fails(cpu_worker, cpu_kv):
+    cpu_worker.submit_load(4, ObjLoadStoreSpec(["missing"]), _cpu_ptrs(cpu_kv, [0, 1]))
+
+    assert not _finish(cpu_worker, 4).success
+
+
+@pytest.mark.cpu_test
+def test_cpu_wait_returns_once_the_kv_is_read(cpu_worker, cpu_kv):
+    names = ObjLoadStoreSpec(["e", "f"])
+    expected = [_row(cpu_kv, [0, 1]), _row(cpu_kv, [2, 3])]
+    cpu_worker.submit_store(5, _cpu_ptrs(cpu_kv, [0, 1, 2, 3]), names)
+    cpu_worker.wait({5})
+
+    # The KV cache may change once wait() returns: the objects keep the bytes
+    # it held at submission.
+    for t in cpu_kv:
+        t.zero_()
+    assert _finish(cpu_worker, 5).success
+    assert torch.equal(cpu_worker._client.objects["e"], expected[0])
+    assert torch.equal(cpu_worker._client.objects["f"], expected[1])

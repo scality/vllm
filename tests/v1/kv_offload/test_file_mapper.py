@@ -67,6 +67,7 @@ def make_mapper_from_offloading_spec(**kwargs) -> FileMapper:
         offloading_spec=spec,
         blocks_per_file=config.cache.blocks_per_chunk,
         parallel_agnostic=kwargs.get("parallel_agnostic", False),
+        kv_layout_family=kwargs.get("kv_layout_family"),
     )
 
 
@@ -222,6 +223,21 @@ def test_canonical_layout_changes_storage_namespace():
     assert "canonical_format" not in direct.fields
     assert canonical.fields["canonical_format"] == "v1-nhd"
     assert direct.base_path != canonical.base_path
+
+
+def test_kv_layout_family_forks_the_direct_layout_namespace():
+    # CPU attention pages differ from GPU ones: a CPU server must not read
+    # objects a GPU server wrote under the same model and parallel sizes.
+    gpu = make_mapper_from_offloading_spec()
+    cpu = make_mapper_from_offloading_spec(kv_layout_family="cpu")
+    cpu_canonical = make_mapper_from_offloading_spec(
+        kv_layout_family="cpu", canonical_layout=True
+    )
+    assert "kv_layout_family" not in gpu.fields
+    assert cpu.fields["kv_layout_family"] == "cpu"
+    assert cpu.base_path != gpu.base_path
+    # Canonical bytes are backend-independent: the format id names them.
+    assert "kv_layout_family" not in cpu_canonical.fields
 
 
 # ---------------------------------------------------------------------------
