@@ -112,7 +112,6 @@ RUN uv pip install \
         'grpcio>=1.66.2' \
         'google-crc32c>=1.5.0' \
         'huggingface_hub>=0.20.0' \
-        'protobuf>=5.27.0,<6.0.0' \
         'pydantic>=2.0.0'
 COPY --from=nixl-build /wheels /wheels
 RUN uv pip install --no-deps \
@@ -120,6 +119,20 @@ RUN uv pip install --no-deps \
         /wheels/nixl[-_]cpu-*.whl \
         /wheels/modelexpress-*.whl \
     && rm -rf /wheels
+
+# modelexpress ships p2p stubs generated for protobuf 5, which the base image's
+# protobuf (6 or 7, which vLLM's tracing needs) rejects. Regenerate them with
+# the grpcio-tools release of the image's grpcio, in a throwaway environment.
+COPY --from=modelexpress modelexpress_common/proto/p2p.proto /tmp/mx-proto/p2p.proto
+RUN set -e; \
+    PKG="$(python3 -c "import importlib.util, os; print(os.path.dirname(importlib.util.find_spec('modelexpress').origin))")"; \
+    GRPC="$(python3 -c "import grpc; print(grpc.__version__)")"; \
+    uv run --no-project --isolated --with "grpcio-tools==${GRPC}" -- \
+        python -m grpc_tools.protoc -I/tmp/mx-proto \
+        --python_out="$PKG" --grpc_python_out="$PKG" /tmp/mx-proto/p2p.proto; \
+    sed -i 's/^import p2p_pb2 as/from . import p2p_pb2 as/' "$PKG/p2p_pb2_grpc.py"; \
+    rm -rf /tmp/mx-proto; \
+    python3 -c "import modelexpress.p2p_pb2_grpc"
 
 # Overlay this checkout's vllm python sources (python-only vs the release tag
 # the base image was built from; see Dockerfile.mx).

@@ -127,8 +127,12 @@ jobs:
 
       - name: Check image (no GPU)
         run: |
+          # The CLI imports vLLM's tracing, which needs the base image's protobuf.
+          # (`vllm --version` needs a GPU in the GPU image.)
           docker run --rm --entrypoint python3 vllm-mx:ci -c \
-              "import nixl, modelexpress, vllm; print('imports ok')"
+              "import vllm.entrypoints.cli.launch"
+          docker run --rm --entrypoint python3 vllm-mx:ci -c \
+              "import nixl, modelexpress.p2p_pb2_grpc, vllm; print('imports ok')"
           docker run --rm --entrypoint bash vllm-mx:ci -c '
               set -e
               for plugin in OBJ REST; do
@@ -209,8 +213,12 @@ jobs:
 
       - name: Check image
         run: |
+          # The CLI imports vLLM's tracing, which needs the base image's protobuf.
+          # (`vllm --version` needs a GPU in the GPU image.)
+          docker run --rm --entrypoint python3 vllm-mx-cpu:ci -c \
+              "import vllm.entrypoints.cli.launch"
           docker run --rm --entrypoint python3 vllm-mx-cpu:ci -c "
-          import modelexpress, nixl
+          import modelexpress.p2p_pb2_grpc, nixl
           from nixl._api import nixl_agent, nixl_agent_config
           from vllm.platforms import current_platform
           assert current_platform.is_cpu()
