@@ -112,11 +112,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The containerd image store lets the default builder export its cache
+      # to the registry while the image stays local for the checks.
+      - uses: docker/setup-docker-action@3f1ab1ab0e29231562e4db4ca600c1a49653bac6 # v5.7.0
+        with:
+          daemon-config: '{"features": {"containerd-snapshotter": true}}'
+
       - name: Build
         env:
           DOCKER_BUILDKIT: "1"
         run: |
+          cache="${{ steps.meta.outputs.image }}:buildcache"
           docker build --platform linux/amd64 -f vllm/docker/Dockerfile.mx \
+              --cache-from "type=registry,ref=${cache}" \
+              --cache-to "type=registry,ref=${cache},mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true" \
               --build-arg NIXL_DEPS_IMAGE="${{ needs.nixl-deps.outputs.image }}" \
               --build-context nixl=nixl \
               --build-context modelexpress=modelexpress \
@@ -199,11 +208,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The containerd image store lets the default builder export its cache
+      # to the registry while the image stays local for the checks.
+      - uses: docker/setup-docker-action@3f1ab1ab0e29231562e4db4ca600c1a49653bac6 # v5.7.0
+        with:
+          daemon-config: '{"features": {"containerd-snapshotter": true}}'
+
       - name: Build
         env:
           DOCKER_BUILDKIT: "1"
         run: |
+          cache="${{ steps.meta.outputs.image }}:buildcache"
           docker build --platform linux/amd64 -f vllm/docker/Dockerfile.mx-cpu \
+              --cache-from "type=registry,ref=${cache}" \
+              --cache-to "type=registry,ref=${cache},mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true" \
               --build-context nixl=nixl \
               --build-context modelexpress=modelexpress \
               --label org.opencontainers.image.revision="${GITHUB_SHA}" \
