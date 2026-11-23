@@ -1,0 +1,159 @@
+# Builds the internal vLLM + nixl + modelexpress image (docker/Dockerfile.mx).
+# The slow nixl-deps image (aws-sdk, UCX) is tagged by a hash of
+# docker/Dockerfile.mx-deps and only rebuilt when that file changes.
+name: mx-image
+
+on:
+  push:
+    branches:
+      - feat/obj-direct-v0.34
+    paths:
+      - "vllm/**"
+      - "docker/Dockerfile.mx"
+      - "docker/Dockerfile.mx-deps"
+      - ".github/workflows/mx-image.yml"
+  workflow_dispatch:
+    inputs:
+      nixl_ref:
+        description: "scality/nixl branch, tag or SHA"
+        default: v1.6.0-scality.2
+      modelexpress_ref:
+        description: "scality/modelexpress branch, tag or SHA"
+        default: v0.5.0-scality.1
+      rebuild_deps:
+        description: "Rebuild nixl-deps even if its tag already exists"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: mx-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io/scality
+  NIXL_REF: ${{ inputs.nixl_ref || 'v1.6.0-scality.2' }}
+  MX_REF: ${{ inputs.modelexpress_ref || 'v0.5.0-scality.1' }}
+
+jobs:
+  nixl-deps:
+    runs-on: ubuntu-24.04-4core
+    timeout-minutes: 300
+    outputs:
+      image: ${{ steps.tag.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - id: tag
+        run: |
+          h=$(sha256sum docker/Dockerfile.mx-deps | cut -c1-12)
+          echo "image=${REGISTRY}/nixl-deps:26.08-cuda13.4-${h}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: exists
+        run: |
+          if [ "${{ inputs.rebuild_deps }}" != "true" ] \
+              && docker manifest inspect "${{ steps.tag.outputs.image }}" >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Reusing ${{ steps.tag.outputs.image }}"
+          fi
+
+      - if: steps.exists.outputs.found != 'true'
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: |
+          docker build --platform linux/amd64 -f docker/Dockerfile.mx-deps \
+              -t "${{ steps.tag.outputs.image }}" .
+          docker push "${{ steps.tag.outputs.image }}"
+
+  vllm-mx:
+    needs: nixl-deps
+    runs-on: ubuntu-24.04-4core
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: vllm
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: scality/nixl
+          ref: ${{ env.NIXL_REF }}
+          path: nixl
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: scality/modelexpress
+          ref: ${{ env.MX_REF }}
+          path: modelexpress
+
+      - id: meta
+        run: |
+          branch=$(echo "${GITHUB_REF_NAME}" | tr '/' '-')
+          echo "image=${REGISTRY}/vllm-mx" >> "$GITHUB_OUTPUT"
+          echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+          echo "short=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+          echo "nixl_sha=$(git -C nixl rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "mx_sha=$(git -C modelexpress rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: |
+          docker build --platform linux/amd64 -f vllm/docker/Dockerfile.mx \
+              --build-arg NIXL_DEPS_IMAGE="${{ needs.nixl-deps.outputs.image }}" \
+              --build-context nixl=nixl \
+              --build-context modelexpress=modelexpress \
+              --label org.opencontainers.image.revision="${GITHUB_SHA}" \
+              --label com.scality.nixl.revision="${{ steps.meta.outputs.nixl_sha }}" \
+              --label com.scality.modelexpress.revision="${{ steps.meta.outputs.mx_sha }}" \
+              -t vllm-mx:ci vllm
+
+      - name: Check image (no GPU)
+        run: |
+          docker run --rm --entrypoint python3 vllm-mx:ci -c \
+              "import nixl, modelexpress, vllm; print('imports ok')"
+          docker run --rm --entrypoint bash vllm-mx:ci -c '
+              set -e
+              for plugin in OBJ REST; do
+                P=$(find / -name "libplugin_${plugin}.so" -path "*-packages*" 2>/dev/null | head -1)
+                [ -n "$P" ] || { echo "${plugin} plugin missing" >&2; exit 1; }
+                # libcuda.so.1 comes from the driver, injected on GPU nodes.
+                if ldd "$P" | grep "not found" | grep -v libcuda.so.1; then exit 1; fi
+                echo "${plugin} plugin ok: $P"
+              done
+              ldd "$(find / -name libplugin_OBJ.so -path "*-packages*" 2>/dev/null | head -1)" \
+                  | grep -q libcuobjclient
+              test -x /app/modelexpress-server'
+          # The overlay must match the checkout exactly; extra files in
+          # site-packages (compiled .so, _version.py) are expected.
+          docker run --rm -v "$PWD/vllm/vllm:/src:ro" --entrypoint bash vllm-mx:ci -c '
+              SP=$(python3 -c "import vllm, os; print(os.path.dirname(vllm.__file__))")
+              out=$(diff -rq -x __pycache__ /src "$SP" | grep -v "^Only in $SP" || true)
+              [ -z "$out" ] || { echo "$out" >&2; exit 1; }
+              echo "overlay ok"'
+
+      - name: Push
+        run: |
+          img="${{ steps.meta.outputs.image }}"
+          for t in "${{ steps.meta.outputs.branch }}" \
+                   "${{ steps.meta.outputs.branch }}-${{ steps.meta.outputs.short }}"; do
+            docker tag vllm-mx:ci "${img}:${t}"
+            docker push "${img}:${t}"
+          done
+          echo "Pushed ${img}:${{ steps.meta.outputs.branch }}-${{ steps.meta.outputs.short }}" \
+              >> "$GITHUB_STEP_SUMMARY"

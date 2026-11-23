@@ -1,0 +1,134 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Internal CPU-only image: vLLM (feat/obj-direct) on the official vLLM CPU
+# release image + the modelexpress python client + nixl with only the REST
+# plugin (no CUDA, no OBJ/cuObject, no UCX).
+#
+# The vLLM CPU image is Ubuntu 22.04, whose rdma-core (v39) predates the
+# MLX5DV_MKEY_INIT_ATTR_FLAGS_UPDATE_TAG flag the REST plugin needs (v44+), so
+# rdma-core is rebuilt from source. Everything is compiled on top of the vLLM
+# CPU image itself so glibc, libstdc++ and python match the runtime.
+#
+# modelexpress-server is not included: run it from the GPU image (or its own
+# image) as a sidecar.
+#
+#   DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.mx-cpu \
+#       --build-context nixl=https://github.com/scality/nixl.git#v1.6.0-scality.2 \
+#       --build-context modelexpress=https://github.com/scality/modelexpress.git#v0.5.0-scality.1 \
+#       -t vllm-mx-cpu:obj-direct .
+
+ARG VLLM_CPU_IMAGE=vllm/vllm-openai-cpu:v0.34.0@sha256:1640fdc27ae499572f611ffd4dc55e0b07ce97608f33566d5834c98671b115d4
+ARG RDMA_CORE_VERSION=v50.0
+
+# ---------------------------------------------------------------------------
+# Shared build tooling on top of the runtime image.
+# ---------------------------------------------------------------------------
+FROM ${VLLM_CPU_IMAGE} AS cpu-build-base
+RUN apt-get update && apt-get -y install --no-install-recommends \
+        cmake ninja-build pkg-config git ca-certificates \
+        libnl-3-dev libnl-route-3-dev libudev-dev libcurl4-openssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# rdma-core, staged under /rdma with the distro layout so it overlays the
+# system copy (if any) in the final image.
+# ---------------------------------------------------------------------------
+FROM cpu-build-base AS rdma-build
+ARG RDMA_CORE_VERSION
+RUN git clone --depth 1 --branch ${RDMA_CORE_VERSION} \
+        https://github.com/linux-rdma/rdma-core.git /src/rdma-core \
+    && cmake -S /src/rdma-core -B /src/rdma-build -GNinja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_INSTALL_LIBDIR=lib/x86_64-linux-gnu \
+        -DNO_MAN_PAGES=1 -DNO_PYVERBS=1 \
+    && ninja -C /src/rdma-build \
+    && DESTDIR=/rdma ninja -C /src/rdma-build install \
+    && rm -rf /src
+
+# ---------------------------------------------------------------------------
+# nixl (REST plugin only, no CUDA) and the modelexpress python client wheel.
+# ---------------------------------------------------------------------------
+FROM cpu-build-base AS nixl-build
+COPY --from=rdma-build /rdma/ /
+RUN ldconfig
+ENV UV_NO_BUILD_ISOLATION=1
+RUN uv pip install meson meson-python pybind11 patchelf pyyaml tomlkit build \
+        'setuptools>=80.9.0'
+
+# A local --build-context checkout carries git-ignored build dirs and a .venv
+# (which `uv build` would pick up instead of /opt/venv): drop them. meson only
+# warns when the REST checks fail, so fail closed if the plugin is missing or
+# links CUDA.
+COPY --from=nixl . /workspace/nixl
+WORKDIR /workspace/nixl
+RUN set -e; \
+    if [ -d .git ]; then \
+        git config --global --add safe.directory /workspace/nixl; \
+        git clean -ffdXq; \
+    else \
+        rm -rf build dist .mesonpy-* .venv; \
+    fi; \
+    meson setup -Denable_plugins=REST -Dwheel_variant=cpu build/ --buildtype=release; \
+    ninja -C build; \
+    P="$(find build -name 'libplugin_REST.so' | head -1)"; \
+    [ -n "$P" ] || { echo "ERROR: REST plugin was not built" >&2; exit 1; }; \
+    if readelf -d "$P" | grep -E 'libcuda|libcudart'; then \
+        echo "ERROR: $P links CUDA" >&2; exit 1; \
+    fi; \
+    mkdir -p /wheels \
+    && cp build/src/bindings/python/nixl-meta/nixl-*.whl /wheels/
+
+# Backend wheel as nixl-cpu (module nixl_cpu): the nixl meta package falls
+# back to it when no CUDA is detected (scality/nixl v1.6.0-scality.2+).
+RUN set -e; \
+    sed -i 's|^setup = \["-Dinstall_headers=false"\]$|setup = ["-Dinstall_headers=false", "-Denable_plugins=REST", "-Dwheel_variant=cpu"]|' pyproject.toml; \
+    grep -q '"-Dwheel_variant=cpu"' pyproject.toml \
+        || { echo "ERROR: pyproject.toml sed patch failed" >&2; exit 1; }; \
+    ./contrib/tomlutil.py --wheel-name nixl-cpu pyproject.toml \
+    && python3 -m build --wheel --no-isolation --skip-dependency-check . \
+    && cp dist/nixl[-_]cpu-*.whl /wheels/
+
+COPY --from=modelexpress . /modelexpress
+RUN cd /modelexpress/modelexpress_client/python \
+    && rm -rf .venv build dist *.egg-info \
+    && python3 -m build --wheel --no-isolation --skip-dependency-check . \
+    && cp dist/modelexpress-*.whl /wheels/
+
+# ---------------------------------------------------------------------------
+# Final stage.
+# ---------------------------------------------------------------------------
+FROM ${VLLM_CPU_IMAGE}
+
+RUN apt-get update && apt-get -y install --no-install-recommends \
+        libnl-3-200 libnl-route-3-200 libcurl4 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=rdma-build /rdma/usr/ /usr/
+COPY --from=rdma-build /rdma/etc/libibverbs.d/ /etc/libibverbs.d/
+RUN ldconfig
+
+# Installs into /opt/venv (VIRTUAL_ENV). --no-deps: see Dockerfile.mx.
+RUN uv pip install \
+        'grpcio>=1.66.2' \
+        'google-crc32c>=1.5.0' \
+        'huggingface_hub>=0.20.0' \
+        'protobuf>=5.27.0,<6.0.0' \
+        'pydantic>=2.0.0'
+COPY --from=nixl-build /wheels /wheels
+RUN uv pip install --no-deps \
+        /wheels/nixl-1.6.0-*.whl \
+        /wheels/nixl[-_]cpu-*.whl \
+        /wheels/modelexpress-*.whl \
+    && rm -rf /wheels
+
+# Overlay this checkout's vllm python sources (python-only vs the release tag
+# the base image was built from; see Dockerfile.mx).
+COPY vllm/ /vllm-src/
+RUN SP="$(python3 -c "import importlib.util, os; print(os.path.dirname(importlib.util.find_spec('vllm').origin))")" \
+    && rm -f /vllm-src/_version.py \
+    && cp -a /vllm-src/. "$SP"/ \
+    && rm -rf /vllm-src
+
+ENV MX_SERVER_ADDRESS=localhost:8001
+
+# Keep vLLM's ENTRYPOINT ["vllm", "serve"].

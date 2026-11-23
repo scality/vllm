@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Slow-moving builder image for nixl/modelexpress releases: AWS SDK, UCX,
+# RDMA stack, cuobjclient dev files, uv + meson tooling. Rebuild only when a
+# pin changes (aws-sdk 1.11.760, UCX v1.23.x, base image tags) and push to
+# the registry; docker/Dockerfile.mx starts from this image so day-to-day
+# releases skip everything here.
+#
+#   DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.mx-deps \
+#       -t nixl-deps:26.08-cuda13.4 .
+
+# ---------------------------------------------------------------------------
+# Harvest cuobjclient dev files from the inference-devel image.
+# ---------------------------------------------------------------------------
+FROM nvcr.io/nvidia/cuda-dl-base:26.08-cuda13.4-inference-devel-ubuntu24.04 AS cuobj_dev
+RUN set -e; \
+    T="$(echo "$(readlink -f /usr/local/cuda)"/targets/*-linux)"; \
+    mkdir -p /cuobj/include /cuobj/lib /cuobj/pkgconfig; \
+    cp -a "$T"/include/cuobj*.h /cuobj/include/; \
+    cp -a "$T"/lib/libcuobjclient.so /cuobj/lib/; \
+    cp -a /usr/lib/pkgconfig/cuobjclient-*.pc /cuobj/pkgconfig/; \
+    basename "$(ls "$T"/lib/libcuobjclient.so.1.*)" > /cuobj/soname
+
+# ---------------------------------------------------------------------------
+# The deps image itself.
+# ---------------------------------------------------------------------------
+FROM nvcr.io/nvidia/cuda-dl-base:26.08-cuda13.4-devel-ubuntu24.04 AS nixl-deps
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install cuobjclient dev files only if this image ships the matching runtime.
+COPY --from=cuobj_dev /cuobj /tmp/cuobj
+RUN set -e; \
+    CUDA_DIR="$(readlink -f /usr/local/cuda)"; \
+    T="$(echo "$CUDA_DIR"/targets/*-linux)"; \
+    have="$(basename "$(ls "$T"/lib/libcuobjclient.so.1.* 2>/dev/null | head -1)" 2>/dev/null)"; \
+    want="$(cat /tmp/cuobj/soname)"; \
+    if [ -e "$T/include/cuobjclient.h" ]; then \
+        echo "cuobjclient dev files already present"; \
+    elif [ -z "$have" ]; then \
+        echo "no cuobjclient runtime in base image, skipping dev install"; \
+    elif [ "$have" != "$want" ]; then \
+        echo "cuobjclient soname mismatch ($have != $want), skipping dev install"; \
+    else \
+        cp -a /tmp/cuobj/include/*.h "$T/include/"; \
+        cp -a /tmp/cuobj/lib/libcuobjclient.so "$T/lib/"; \
+        PC="$(ls /tmp/cuobj/pkgconfig/cuobjclient-*.pc | head -1)"; \
+        mkdir -p /usr/lib/pkgconfig; \
+        sed "s|^cudaroot=.*|cudaroot=$CUDA_DIR|" "$PC" > "/usr/lib/pkgconfig/$(basename "$PC")"; \
+        echo "installed cuobjclient dev files from inference-devel image"; \
+    fi; \
+    rm -rf /tmp/cuobj
+
+RUN apt-get update && apt-get -y install \
+        ninja-build cmake build-essential python3-dev libpython3-dev \
+        autotools-dev automake libtool libaio-dev \
+        hwloc libhwloc-dev pkg-config wget git \
+        libcurl4-openssl-dev libssl-dev uuid-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Reinstall RDMA stack so the UCX verbs/efa modules can be built.
+RUN apt-get update && apt-get -y install --reinstall \
+        libibverbs-dev rdma-core ibverbs-utils libibumad-dev \
+        libnuma-dev librdmacm-dev ibverbs-providers \
+    && rm -rf /var/lib/apt/lists/*
+
+# AWS SDK (needed by nixl's obj_utils / OBJ plugin). Installs to
+# /usr/local/lib64, including the bundled aws-c-* CRT libs.
+RUN git clone --recurse-submodules --depth 1 --shallow-submodules \
+        https://github.com/aws/aws-sdk-cpp.git --branch 1.11.760 \
+        /usr/local/src/aws-sdk-cpp \
+    && mkdir /usr/local/src/aws-sdk-build && cd /usr/local/src/aws-sdk-build \
+    && cmake ../aws-sdk-cpp/ \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_ONLY="s3;s3-crt" \
+        -DENABLE_TESTING=OFF \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_CXX_STANDARD=20 \
+    && make -j$(nproc) && make install \
+    && rm -rf /usr/local/src/aws-sdk-build
+
+# UCX v1.23.x, built against the image CUDA and verbs/EFA stack.
+RUN rm -rf /usr/lib/ucx /opt/hpcx/ucx \
+    && git clone https://github.com/openucx/ucx.git /usr/local/src/ucx \
+    && cd /usr/local/src/ucx && git checkout v1.23.x && ./autogen.sh \
+    && ./contrib/configure-release-mt \
+        --prefix=/usr \
+        --enable-shared --disable-static --disable-doxygen-doc \
+        --enable-optimizations --without-avx --enable-cma \
+        --enable-devel-headers --enable-experimental-api \
+        --with-cuda=/usr/local/cuda \
+        --with-verbs --with-dm --without-gdrcopy --with-efa \
+    && make -j$(nproc) && make -j$(nproc) install-strip && ldconfig
+
+# uv + python build tooling (no torch: the nixl bindings link none, and the
+# meson-python build-requires pin is bypassed with --no-isolation).
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+ENV UV_CACHE_DIR=/workspace/.cache/uv \
+    UV_NO_BUILD_ISOLATION=1 \
+    UV_NO_SYNC=1 \
+    UV_BREAK_SYSTEM_PACKAGES=1 \
+    UV_PYTHON=python3.12
+RUN mkdir -p $UV_CACHE_DIR \
+    && uv pip install --system --upgrade \
+        meson meson-python pybind11 patchelf pyYAML click tabulate \
+        tomlkit build auditwheel \
+    && uv pip install --system --upgrade 'setuptools>=80.9.0'
+
+# System default search covers /usr/lib{,64}/x86_64-linux-gnu/pkgconfig and
+# /usr/lib/pkgconfig (rdma-core, cuobjclient); the aws-sdk .pc files live
+# under /usr/local, so put those on the path too or meson silently skips the
+# OBJ plugin.
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/local/lib/x86_64-linux-gnu/pkgconfig
