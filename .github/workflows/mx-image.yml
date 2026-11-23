@@ -1,5 +1,6 @@
-# Builds the internal vLLM + nixl + modelexpress image (docker/Dockerfile.mx).
-# The slow nixl-deps image (aws-sdk, UCX) is tagged by a hash of
+# Builds the internal vLLM + nixl + modelexpress images: vllm-mx for GPUs
+# (docker/Dockerfile.mx) and vllm-mx-cpu (docker/Dockerfile.mx-cpu). The slow
+# nixl-deps image (aws-sdk, UCX) the GPU image builds on is tagged by a hash of
 # docker/Dockerfile.mx-deps and only rebuilt when that file changes.
 name: mx-image
 
@@ -11,6 +12,7 @@ on:
       - "vllm/**"
       - "docker/Dockerfile.mx"
       - "docker/Dockerfile.mx-deps"
+      - "docker/Dockerfile.mx-cpu"
       - ".github/workflows/mx-image.yml"
   workflow_dispatch:
     inputs:
@@ -153,6 +155,97 @@ jobs:
           for t in "${{ steps.meta.outputs.branch }}" \
                    "${{ steps.meta.outputs.branch }}-${{ steps.meta.outputs.short }}"; do
             docker tag vllm-mx:ci "${img}:${t}"
+            docker push "${img}:${t}"
+          done
+          echo "Pushed ${img}:${{ steps.meta.outputs.branch }}-${{ steps.meta.outputs.short }}" \
+              >> "$GITHUB_STEP_SUMMARY"
+
+  vllm-mx-cpu:
+    runs-on: ubuntu-24.04-4core
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: vllm
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: scality/nixl
+          ref: ${{ env.NIXL_REF }}
+          path: nixl
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: scality/modelexpress
+          ref: ${{ env.MX_REF }}
+          path: modelexpress
+
+      - id: meta
+        run: |
+          branch=$(echo "${GITHUB_REF_NAME}" | tr '/' '-')
+          echo "image=${REGISTRY}/vllm-mx-cpu" >> "$GITHUB_OUTPUT"
+          echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+          echo "short=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+          echo "nixl_sha=$(git -C nixl rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "mx_sha=$(git -C modelexpress rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: |
+          docker build --platform linux/amd64 -f vllm/docker/Dockerfile.mx-cpu \
+              --build-context nixl=nixl \
+              --build-context modelexpress=modelexpress \
+              --label org.opencontainers.image.revision="${GITHUB_SHA}" \
+              --label com.scality.nixl.revision="${{ steps.meta.outputs.nixl_sha }}" \
+              --label com.scality.modelexpress.revision="${{ steps.meta.outputs.mx_sha }}" \
+              -t vllm-mx-cpu:ci vllm
+
+      - name: Check image
+        run: |
+          docker run --rm --entrypoint python3 vllm-mx-cpu:ci -c "
+          import modelexpress, nixl
+          from nixl._api import nixl_agent, nixl_agent_config
+          from vllm.platforms import current_platform
+          assert current_platform.is_cpu()
+          assert nixl._pkg.__name__ == 'nixl_cpu', nixl._pkg.__name__
+          plugins = nixl_agent('ci', nixl_agent_config(backends=[])).get_plugin_list()
+          assert 'REST' in plugins, plugins
+          print('imports ok, plugins', plugins)"
+          docker run --rm --entrypoint bash vllm-mx-cpu:ci -c '
+              set -e
+              P=$(find / -name libplugin_REST.so -path "*-packages*" 2>/dev/null | head -1)
+              [ -n "$P" ] || { echo "REST plugin missing" >&2; exit 1; }
+              if ldd "$P" | grep "not found"; then exit 1; fi
+              echo "REST plugin ok: $P"'
+          docker run --rm -v "$PWD/vllm/vllm:/src:ro" --entrypoint bash vllm-mx-cpu:ci -c '
+              SP=$(python3 -c "import vllm, os; print(os.path.dirname(vllm.__file__))")
+              out=$(diff -rq -x __pycache__ /src "$SP" | grep -v "^Only in $SP" || true)
+              [ -z "$out" ] || { echo "$out" >&2; exit 1; }
+              echo "overlay ok"'
+
+      - name: Test the CPU object store worker
+        run: |
+          docker run --rm -v "$PWD/vllm/tests:/t/tests:ro" -w /t --entrypoint bash \
+              vllm-mx-cpu:ci -c '
+              set -e
+              uv pip install -q pytest pytest-asyncio tblib
+              python3 -m pytest -v -p no:cacheprovider --noconftest \
+                  tests/v1/kv_offload/obj/test_worker.py \
+                  tests/v1/kv_offload/test_file_mapper.py'
+
+      - name: Push
+        run: |
+          img="${{ steps.meta.outputs.image }}"
+          for t in "${{ steps.meta.outputs.branch }}" \
+                   "${{ steps.meta.outputs.branch }}-${{ steps.meta.outputs.short }}"; do
+            docker tag vllm-mx-cpu:ci "${img}:${t}"
             docker push "${img}:${t}"
           done
           echo "Pushed ${img}:${{ steps.meta.outputs.branch }}-${{ steps.meta.outputs.short }}" \
