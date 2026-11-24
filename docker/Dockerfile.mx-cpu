@@ -13,7 +13,7 @@
 # image) as a sidecar.
 #
 #   DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.mx-cpu \
-#       --build-context nixl=https://github.com/scality/nixl.git#v1.6.0-scality.2 \
+#       --build-context nixl=https://github.com/scality/nixl.git#v1.6.0-scality.1 \
 #       --build-context modelexpress=https://github.com/scality/modelexpress.git#v0.5.0-scality.1 \
 #       -t vllm-mx-cpu:obj-direct .
 
@@ -80,7 +80,7 @@ RUN set -e; \
     && cp build/src/bindings/python/nixl-meta/nixl-*.whl /wheels/
 
 # Backend wheel as nixl-cpu (module nixl_cpu): the nixl meta package falls
-# back to it when no CUDA is detected (scality/nixl v1.6.0-scality.2+).
+# back to it when no CUDA is detected (scality/nixl v1.6.0-scality.1+).
 RUN set -e; \
     sed -i 's|^setup = \["-Dinstall_headers=false"\]$|setup = ["-Dinstall_headers=false", "-Denable_plugins=REST", "-Dwheel_variant=cpu"]|' pyproject.toml; \
     grep -q '"-Dwheel_variant=cpu"' pyproject.toml \
