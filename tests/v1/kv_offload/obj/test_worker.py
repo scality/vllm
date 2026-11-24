@@ -21,7 +21,7 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.obj.client import NIXL_WRITE, ObjTransferResult
 from vllm.v1.kv_offload.obj.common import ObjLoadStoreSpec, owner_of
-from vllm.v1.kv_offload.obj.cpu_worker import ObjCpuOffloadingWorker
+from vllm.v1.kv_offload.obj.cpu_worker import ObjCpuOffloadingWorker, _Copier
 from vllm.v1.kv_offload.obj.worker import ObjOffloadingWorker
 from vllm.v1.kv_offload.pointer_utils import (
     remap_device_pointers,
@@ -665,3 +665,35 @@ def test_cpu_wait_returns_once_the_kv_is_read(cpu_worker, cpu_kv):
     assert _finish(cpu_worker, 5).success
     assert torch.equal(cpu_worker._client.objects["e"], expected[0])
     assert torch.equal(cpu_worker._client.objects["f"], expected[1])
+
+
+@pytest.mark.cpu_test
+def test_copy_threads_move_every_byte_of_large_and_scattered_ranges():
+    """Ranges longer than a thread's share are cut, and contiguous ones
+    merged, without moving any byte to the wrong place."""
+    gen = torch.Generator().manual_seed(0)
+    src = torch.randint(-128, 127, (24 * 2**20,), dtype=torch.int8, generator=gen)
+    dst = torch.zeros_like(src)
+    # (src offset, dst offset, bytes): one range over 4 MiB, two contiguous on
+    # both sides, one scattered.
+    ranges = [
+        (0, 2**20, 10 * 2**20),
+        (12 * 2**20, 0, 4096),
+        (12 * 2**20 + 4096, 4096, 4096),
+        (20 * 2**20, 22 * 2**20, 333),
+    ]
+    copier = _Copier(threads=4, cpus=None)
+    futures = copier.submit(
+        np.array([dst.data_ptr() + d for _, d, _ in ranges], dtype=np.uint64),
+        np.array([src.data_ptr() + s for s, _, _ in ranges], dtype=np.uint64),
+        np.array([n for _, _, n in ranges], dtype=np.uint64),
+    )
+    for f in futures:
+        f.result()
+    copier.shutdown()
+
+    expected = torch.zeros_like(src)
+    for s_off, d_off, n in ranges:
+        expected[d_off : d_off + n] = src[s_off : s_off + n]
+    assert len(futures) > 1
+    assert torch.equal(dst, expected)

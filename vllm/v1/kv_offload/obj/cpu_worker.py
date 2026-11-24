@@ -7,17 +7,21 @@ layout. A store copies the chunks' KV into slots of a staging buffer in host
 memory, in the CPU tier's chunk layout, then PUTs each slot as one object over
 RDMA. A load GETs the objects into slots, then copies them into the KV cache.
 A job larger than the staging buffer goes through it in pieces. A driver
-thread runs the copies, which release the GIL, and moves pieces from one stage
-to the next.
+thread moves pieces from one stage to the next; a pool of threads runs the
+copies, which release the GIL, sharing each piece between them. The offload
+threads run on the CPUs vLLM's OpenMP threads are not bound to.
 """
 
 import ctypes
+import os
 import threading
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import numpy as np
+import regex as re
 import torch
 
 from vllm.logger import init_logger
@@ -52,6 +56,9 @@ class _Job:
     # Store pieces still copying out of the KV cache.
     copying: int = 0
     failed: bool = False
+    # Seconds the pieces spent in transfers and in copies, summed.
+    transfer_s: float = 0.0
+    copy_s: float = 0.0
 
     @property
     def num_chunks(self) -> int:
@@ -68,6 +75,8 @@ class _Piece:
     job: _Job
     chunks: list[int]
     slots: list[int] = field(default_factory=list)
+    # When its current stage, transfer or copy, started.
+    stage_start: float = 0.0
 
     @property
     def obj_names(self) -> list[str]:
@@ -135,17 +144,124 @@ class _CopyOps:
         )
 
 
-def _memmove_all(dst: np.ndarray, src: np.ndarray, sizes: np.ndarray) -> None:
-    """Copy each range, merging ranges contiguous on both sides first."""
-    if len(sizes) == 0:
-        return
+# Longest range one copy thread moves at once, so a piece's bytes can be
+# shared evenly between the threads.
+_MAX_RUN_BYTES = 4 * 2**20
+
+
+def _runs(
+    dst: np.ndarray, src: np.ndarray, sizes: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The ranges to copy, merged where contiguous on both sides, then cut to
+    at most _MAX_RUN_BYTES."""
     breaks = np.flatnonzero(
         (dst[1:] != dst[:-1] + sizes[:-1]) | (src[1:] != src[:-1] + sizes[:-1])
     )
     starts = np.concatenate(([0], breaks + 1))
-    run_bytes = np.add.reduceat(sizes, starts)
-    for s, n in zip(starts.tolist(), run_bytes.tolist()):
-        ctypes.memmove(int(dst[s]), int(src[s]), n)
+    run_bytes = np.add.reduceat(sizes, starts).astype(np.int64)
+    pieces = (run_bytes + _MAX_RUN_BYTES - 1) // _MAX_RUN_BYTES
+    first = np.repeat(np.cumsum(pieces) - pieces, pieces)
+    offsets = (np.arange(int(pieces.sum())) - first) * _MAX_RUN_BYTES
+    lengths = np.minimum(np.repeat(run_bytes, pieces) - offsets, _MAX_RUN_BYTES)
+    offsets = offsets.astype(np.uint64)
+    return (
+        np.repeat(dst[starts], pieces) + offsets,
+        np.repeat(src[starts], pieces) + offsets,
+        lengths,
+    )
+
+
+def _memmove_runs(dst: np.ndarray, src: np.ndarray, sizes: np.ndarray) -> None:
+    for d, s, n in zip(dst.tolist(), src.tolist(), sizes.tolist()):
+        ctypes.memmove(d, s, n)
+
+
+def _parse_cpu_list(text: str) -> set[int]:
+    """CPUs of a list like "0-3,8" or "0 1 2"."""
+    cpus: set[int] = set()
+    for item in re.split(r"[,\s]+", text.strip()):
+        if "-" in item:
+            first, last = item.split("-")
+            cpus.update(range(int(first), int(last) + 1))
+        elif item:
+            cpus.add(int(item))
+    return cpus
+
+
+def _offload_cpus() -> set[int] | None:
+    """CPUs for the offload threads: the container's that vLLM's OpenMP threads
+    are not bound to (all of them when that leaves none), or None where
+    affinity cannot be set. A thread inherits the affinity of the thread
+    creating it, which OpenMP binding narrows to one core."""
+    if not hasattr(os, "sched_setaffinity"):
+        return None
+    allowed: set[int] = set()
+    for path in (
+        "/sys/fs/cgroup/cpuset.cpus.effective",
+        "/sys/fs/cgroup/cpuset/cpuset.effective_cpus",
+    ):
+        try:
+            with open(path) as f:
+                allowed = _parse_cpu_list(f.read())
+            break
+        except (OSError, ValueError):
+            continue
+    if not allowed:
+        allowed = set(range(os.cpu_count() or 1))
+    omp: set[int] = set()
+    try:
+        kmp = re.search(r"proclist=\[([^\]]*)\]", os.environ.get("KMP_AFFINITY", ""))
+        if kmp:
+            omp = _parse_cpu_list(kmp.group(1))
+        elif "GOMP_CPU_AFFINITY" in os.environ:
+            omp = _parse_cpu_list(os.environ["GOMP_CPU_AFFINITY"])
+        elif "OMP_PLACES" in os.environ:
+            omp = _parse_cpu_list(os.environ["OMP_PLACES"].strip("{}"))
+    except ValueError:
+        omp = set()
+    return (allowed - omp) or allowed
+
+
+def _pin(cpus: set[int] | None) -> None:
+    if cpus:
+        try:
+            os.sched_setaffinity(0, cpus)
+        except OSError:
+            logger.debug("Cannot pin an object store offload thread to %s", cpus)
+
+
+class _Copier:
+    """Copies ranges with a pool of threads, sharing each copy between them."""
+
+    def __init__(self, threads: int, cpus: set[int] | None):
+        self._threads = threads
+        self._pool = ThreadPoolExecutor(
+            threads,
+            thread_name_prefix="vllm_offloading_obj_copy",
+            initializer=_pin,
+            initargs=(cpus,),
+        )
+
+    def submit(
+        self, dst: np.ndarray, src: np.ndarray, sizes: np.ndarray
+    ) -> list[Future]:
+        if len(sizes) == 0:
+            return []
+        dst, src, sizes = _runs(dst, src, sizes)
+        # Contiguous groups of runs of about equal bytes, one per thread.
+        ends = np.cumsum(sizes)
+        bounds = np.searchsorted(
+            ends, ends[-1] * np.arange(1, self._threads) / self._threads
+        )
+        edges = [0, *np.unique(bounds).tolist(), len(sizes)]
+        return [
+            self._pool.submit(_memmove_runs, dst[a:b], src[a:b], sizes[a:b])
+            for a, b in zip(edges, edges[1:])
+            if b > a
+        ]
+
+    def shutdown(self) -> None:
+        self._pool.shutdown(wait=True)
 
 
 class ObjCpuOffloadingWorker(OffloadingWorker):
@@ -160,6 +276,7 @@ class ObjCpuOffloadingWorker(OffloadingWorker):
         agent_name: str,
         piece_chunks: int | None = None,
         max_inflight_gets: int | None = None,
+        copy_threads: int = 8,
     ):
         """Args:
         kv_caches: KV caches in host memory, direct layout.
@@ -174,6 +291,8 @@ class ObjCpuOffloadingWorker(OffloadingWorker):
             (default a quarter of its slots).
         max_inflight_gets: Most chunks being read from the store at once
             (default all the slots).
+        copy_threads: Threads copying between the KV cache and the staging
+            buffer.
 
         """
         self._blocks_per_chunk = blocks_per_chunk
@@ -191,6 +310,8 @@ class ObjCpuOffloadingWorker(OffloadingWorker):
         # deterministic.
         self._staging = torch.zeros((num_slots, chunk_bytes), dtype=torch.int8)
         self._ops = _CopyOps(self._staging, kv_caches, blocks_per_chunk)
+        self._cpus = _offload_cpus()
+        self._copier = _Copier(copy_threads, self._cpus)
 
         self._client = ObjStoreClient(agent_name, store_config, io_threads)
         try:
@@ -204,9 +325,12 @@ class ObjCpuOffloadingWorker(OffloadingWorker):
             self._client.shutdown()
             raise
         logger.info(
-            "Object store staging: %d slots of %d bytes in host memory",
+            "Object store staging: %d slots of %d bytes in host memory, "
+            "%d copy threads on %s CPUs",
             num_slots,
             chunk_bytes,
+            copy_threads,
+            len(self._cpus) if self._cpus else "inherited",
         )
 
         # Everything below is guarded by _cond.
@@ -216,6 +340,8 @@ class ObjCpuOffloadingWorker(OffloadingWorker):
         self._waiting_loads: deque[_Job] = deque()
         self._waiting_stores: deque[_Job] = deque()
         self._pieces: dict[int, _Piece] = {}
+        # Pieces being copied: their copy threads' futures.
+        self._copying: dict[int, list[Future]] = {}
         self._next_piece_id = 0
         self._gets_in_flight = 0
         self._results: list[TransferResult] = []
@@ -297,6 +423,7 @@ class ObjCpuOffloadingWorker(OffloadingWorker):
             self._cond.notify_all()
         self._thread.join()
         try:
+            self._copier.shutdown()
             self._client.drain()
         finally:
             self._client.shutdown()
@@ -304,6 +431,7 @@ class ObjCpuOffloadingWorker(OffloadingWorker):
     # Driver thread
 
     def _run(self) -> None:
+        _pin(self._cpus)
         with self._cond:
             while not self._stop:
                 try:
@@ -318,10 +446,12 @@ class ObjCpuOffloadingWorker(OffloadingWorker):
                     self._cond.wait()
 
     def _step(self) -> None:
+        now = time.perf_counter()
         for obj_result in self._client.poll():
             piece_id = obj_result.job_id
             piece = self._pieces[piece_id]
             job = piece.job
+            job.transfer_s += now - piece.stage_start
             if not job.is_store:
                 self._gets_in_flight -= len(piece.chunks)
             if not obj_result.success:
@@ -333,8 +463,13 @@ class ObjCpuOffloadingWorker(OffloadingWorker):
                     )
                 job.failed = True
             if not job.is_store and not job.failed:
-                self._copy(piece, to_kv=True)
-            self._finish_piece(piece_id)
+                self._start_copy(piece_id, piece, to_kv=True)
+            else:
+                self._finish_piece(piece_id)
+        for piece_id, futures in list(self._copying.items()):
+            if all(f.done() for f in futures):
+                del self._copying[piece_id]
+                self._copied(piece_id, futures)
         self._start_pieces(self._waiting_loads)
         self._start_pieces(self._waiting_stores)
 
@@ -364,34 +499,53 @@ class ObjCpuOffloadingWorker(OffloadingWorker):
             piece_id = self._next_piece_id
             self._next_piece_id += 1
             self._pieces[piece_id] = piece
-            op = NIXL_WRITE
             if job.is_store:
                 job.copying += 1
-                self._copy(piece, to_kv=False)
-                job.copying -= 1
-                self._cond.notify_all()
+                self._start_copy(piece_id, piece, to_kv=False)
             else:
-                op = NIXL_READ
                 self._gets_in_flight += num_chunks
-            self._client.submit(
-                piece_id, np.asarray(slots, dtype=np.int32), piece.obj_names, op
-            )
+                self._transfer(piece_id, piece, NIXL_READ)
 
-    def _copy(self, piece: _Piece, to_kv: bool) -> None:
-        """Copy a piece between the KV cache and its slots, without the lock:
-        the engine thread keeps submitting meanwhile."""
+    def _transfer(self, piece_id: int, piece: _Piece, op: str) -> None:
+        piece.stage_start = time.perf_counter()
+        self._client.submit(
+            piece_id, np.asarray(piece.slots, dtype=np.int32), piece.obj_names, op
+        )
+
+    def _start_copy(self, piece_id: int, piece: _Piece, to_kv: bool) -> None:
+        """Have the copy threads move a piece between the KV cache and its
+        slots; the driver keeps going meanwhile."""
         device_ptrs = select_device_chunks(
             piece.job.device_ptrs, self._blocks_per_chunk, piece.chunks
         )
         kv_ptrs, staging_ptrs, sizes = self._ops.build(device_ptrs, piece.slots)
-        self._cond.release()
-        try:
-            if to_kv:
-                _memmove_all(kv_ptrs, staging_ptrs, sizes)
-            else:
-                _memmove_all(staging_ptrs, kv_ptrs, sizes)
-        finally:
-            self._cond.acquire()
+        piece.stage_start = time.perf_counter()
+        if to_kv:
+            futures = self._copier.submit(kv_ptrs, staging_ptrs, sizes)
+        else:
+            futures = self._copier.submit(staging_ptrs, kv_ptrs, sizes)
+        self._copying[piece_id] = futures
+
+    def _copied(self, piece_id: int, futures: list[Future]) -> None:
+        piece = self._pieces[piece_id]
+        job = piece.job
+        job.copy_s += time.perf_counter() - piece.stage_start
+        error = next((f.exception() for f in futures if f.exception()), None)
+        if error is not None and not job.failed:
+            logger.warning(
+                "Object store job %d failed: copy %s the KV cache: %s",
+                job.job_id,
+                "out of" if job.is_store else "into",
+                error,
+            )
+        job.failed = job.failed or error is not None
+        if job.is_store:
+            job.copying -= 1
+            self._cond.notify_all()
+            if not job.failed:
+                self._transfer(piece_id, piece, NIXL_WRITE)
+                return
+        self._finish_piece(piece_id)
 
     def _finish_piece(self, piece_id: int) -> None:
         piece = self._pieces.pop(piece_id)
@@ -400,12 +554,27 @@ class ObjCpuOffloadingWorker(OffloadingWorker):
         job.in_flight -= 1
         if job.in_flight == 0 and job.started:
             del self._jobs[job.job_id]
+            elapsed = time.perf_counter() - job.submit_time
+            size = job.num_chunks * self._chunk_bytes
+            logger.debug(
+                "Object store %s job %d: %d chunks, %.1f MB in %.1f ms "
+                "(%.2f GB/s); transfers %.1f ms, copies %.1f ms, summed over "
+                "pieces",
+                "store" if job.is_store else "load",
+                job.job_id,
+                job.num_chunks,
+                size / 1e6,
+                elapsed * 1e3,
+                size / elapsed / 1e9,
+                job.transfer_s * 1e3,
+                job.copy_s * 1e3,
+            )
             self._results.append(
                 TransferResult(
                     job_id=job.job_id,
                     success=not job.failed,
-                    transfer_size=job.num_chunks * self._chunk_bytes,
-                    transfer_time=time.perf_counter() - job.submit_time,
+                    transfer_size=size,
+                    transfer_time=elapsed,
                 )
             )
         self._cond.notify_all()
@@ -418,3 +587,5 @@ class ObjCpuOffloadingWorker(OffloadingWorker):
         self._waiting_loads.clear()
         self._waiting_stores.clear()
         self._pieces.clear()
+        self._copying.clear()
+        self._cond.notify_all()

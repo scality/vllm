@@ -19,6 +19,8 @@ reads what the other wrote. kv_connector_extra_config:
         (default all its staging slots)
     cpu_to_gpu_copy: "triton" copies loaded chunks into the KV cache with
         the Triton kernel whatever the page size (default "auto")
+    copy_threads: on CPU, threads copying between the KV cache and the
+        staging buffer (default 8)
 
 Set kv_load_failure_policy to "recompute": a load fails when the store has
 evicted the chunk since it was looked up. On the CPU platform, the KV cache is
@@ -147,6 +149,7 @@ class ObjOffloadingSpec(OffloadingSpec):
                 piece_chunks=self.piece_chunks and int(self.piece_chunks),
                 max_inflight_gets=self.max_inflight_gets
                 and int(self.max_inflight_gets),
+                copy_threads=int(self.extra_config.get("copy_threads", 8)),
             )
         if self._worker is None:
             from vllm.v1.kv_offload.obj.worker import ObjOffloadingWorker
