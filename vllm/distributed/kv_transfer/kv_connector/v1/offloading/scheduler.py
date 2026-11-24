@@ -103,6 +103,9 @@ class TransferJobStatus:
     fenced_block_ids: list[int] | None = None
     # A load's seconds per medium, slowest worker, when its workers timed them.
     part_times: dict[str, float] | None = None
+    # A load's issue time (time.monotonic()) and KV bytes on one worker.
+    start_time: float | None = None
+    kv_bytes: int = 0
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -181,6 +184,8 @@ class SchedulerOffloadConfig(NamedTuple):
     sync_load_budget_bytes: int = 0
     # KV bytes per token on one worker, summed over the offloaded groups.
     kv_bytes_per_token: int = 0
+    # KV bytes per GPU block on one worker, per offloaded group.
+    group_kv_bytes_per_block: tuple[int, ...] = ()
 
     @classmethod
     def from_spec(
@@ -339,6 +344,10 @@ class SchedulerOffloadConfig(NamedTuple):
             kv_bytes_per_token=sum(
                 _group_kv_bytes_per_block(kv_cache_config.kv_cache_groups[g.group_id])
                 // g.tokens_per_block
+                for g in spec.config.groups
+            ),
+            group_kv_bytes_per_block=tuple(
+                _group_kv_bytes_per_block(kv_cache_config.kv_cache_groups[g.group_id])
                 for g in spec.config.groups
             ),
         )
@@ -1992,6 +2001,8 @@ class OffloadingConnectorScheduler:
             keys=tuple(dict.fromkeys(keys_to_load)),
             is_store=False,
             is_sync_load=sync_load,
+            start_time=time.monotonic(),
+            kv_bytes=self._load_kv_bytes(dst_spec),
         )
 
         # A sync load completes before this step's forward pass.
@@ -2091,6 +2102,17 @@ class OffloadingConnectorScheduler:
             pending_count=self.config.num_workers,
             keys=tuple(keys),
             is_store=False,
+            start_time=time.monotonic(),
+            kv_bytes=self._load_kv_bytes(dst_spec),
+        )
+
+    def _load_kv_bytes(self, dst_spec: GPULoadStoreSpec) -> int:
+        """KV bytes a load writes into one worker's KV cache."""
+        return sum(
+            num_blocks * block_bytes
+            for num_blocks, block_bytes in zip(
+                dst_spec.group_sizes, self.config.group_kv_bytes_per_block
+            )
         )
 
     def _advance_streaming_loads(self) -> None:
@@ -3034,6 +3056,14 @@ class OffloadingConnectorScheduler:
                         job_status.req_id,
                     )
                     req_status.load_failed = True
+                if job_status.start_time is not None and not job_status.failed:
+                    self._connector_stats.observe_histogram(
+                        _ConnectorMetricName.LOAD_JOB_SECONDS,
+                        time.monotonic() - job_status.start_time,
+                    )
+                    self._connector_stats.increase_counter(
+                        _ConnectorMetricName.LOAD_JOB_KV_BYTES, job_status.kv_bytes
+                    )
                 if job_status.part_times and not job_status.failed:
                     self.manager.record_load_times(
                         job_status.keys, req_status.req_context, job_status.part_times

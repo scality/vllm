@@ -53,6 +53,8 @@ class _ConnectorMetricName:
     LOOKUP_SYNC_DELAY = "vllm:kv_offload_lookup_sync_delay_seconds"
     LOOKUP_ASYNC_DELAY = "vllm:kv_offload_lookup_async_delay_seconds"
     ALLOCATION_FAILURE = "vllm:kv_offload_allocation_failure"
+    LOAD_JOB_SECONDS = "vllm:kv_offload_load_job_seconds"
+    LOAD_JOB_KV_BYTES = "vllm:kv_offload_load_job_kv_bytes"
 
 
 class _TransferType:
@@ -98,6 +100,23 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
         _TransferMetricName.STORE_SIZE: OffloadingHistogramMetadata(
             documentation="Histogram of KV offload store operation size, in bytes.",
             buckets=TRANSFER_SIZE_BUCKETS,
+        ),
+        _ConnectorMetricName.LOAD_JOB_SECONDS: OffloadingHistogramMetadata(
+            documentation=(
+                "Histogram of the elapsed time of a load job, from the "
+                "scheduler step that issues it to the step its last worker "
+                "reports it, in seconds, whatever medium and path the load "
+                "uses. With LOAD_JOB_KV_BYTES, gives a load throughput that "
+                "is not summed over workers."
+            ),
+            buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10),
+        ),
+        _ConnectorMetricName.LOAD_JOB_KV_BYTES: OffloadingCounterMetadata(
+            documentation=(
+                "Total KV bytes the successful load jobs wrote into one "
+                "worker's KV cache (the whole KV with replicated layers such "
+                "as MLA, a worker's shard otherwise)."
+            ),
         ),
         _ConnectorMetricName.LOOKUP_SYNC_DELAY: OffloadingHistogramMetadata(
             documentation=(

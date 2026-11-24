@@ -2263,6 +2263,42 @@ def test_scheduler_reports_lookup_sync_delay(request_runner):
     assert reduced[f"{_ConnectorMetricName.LOOKUP_SYNC_DELAY}_sum"] > 0
 
 
+def test_scheduler_reports_load_job_elapsed_time_and_kv_bytes(request_runner):
+    """A completed load reports its elapsed time, and the KV bytes it wrote
+    into one worker's KV cache, counted from its GPU blocks."""
+    block_size, blocks_per_chunk = 4, 3
+    tokens_per_chunk = block_size * blocks_per_chunk
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=100,
+        async_scheduling=False,
+        blocks_per_chunk=blocks_per_chunk,
+    )
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.new_request(token_ids=[0] * (tokens_per_chunk + 1))
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0, 1, 2))
+    runner.scheduler.reset_prefix_cache()
+    runner.kv_connector_stats.clear()
+
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    runner.new_request(token_ids=[0] * tokens_per_chunk)
+    runner.connector_scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 1
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(0, 1, 2))
+
+    reduced = _reduce_kv_connector_stats(runner)
+    block_bytes = runner.connector_scheduler.config.group_kv_bytes_per_block[0]
+    assert block_bytes > 0
+    assert reduced[f"{_ConnectorMetricName.LOAD_JOB_SECONDS}_count"] == 1
+    assert reduced[f"{_ConnectorMetricName.LOAD_JOB_SECONDS}_sum"] > 0
+    assert reduced[_ConnectorMetricName.LOAD_JOB_KV_BYTES] == (
+        blocks_per_chunk * block_bytes
+    )
+
+
 def test_on_schedule_end_is_the_last_manager_call_of_a_step(request_runner):
     """on_schedule_end must run after every other manager call of the step.
 
