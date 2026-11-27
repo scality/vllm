@@ -14,7 +14,7 @@
 #
 #   DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.mx-cpu \
 #       --build-context nixl=https://github.com/scality/nixl.git#v1.6.0-scality.1 \
-#       --build-context modelexpress=https://github.com/scality/modelexpress.git#v0.5.0-scality.1 \
+#       --build-context modelexpress=https://github.com/scality/modelexpress.git#v0.5.0-scality.2 \
 #       -t vllm-mx-cpu:obj-direct .
 
 ARG VLLM_CPU_IMAGE=vllm/vllm-openai-cpu:v0.34.0@sha256:1640fdc27ae499572f611ffd4dc55e0b07ce97608f33566d5834c98671b115d4
