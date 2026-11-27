@@ -64,18 +64,35 @@ RUN set -e; \
     mkdir -p /wheels \
     && cp build/src/bindings/python/nixl-meta/nixl-*.whl /wheels/
 
-# nixl backend wheel (nixl_cu13): inject the meson setup args into
-# pyproject.toml, rename the wheel, and build without isolation. Skip the
-# build-requires check: its torch pin only feeds the optional nixl_ep example,
-# which meson skips without torch.
+# nixl_ep (expert-parallel all-to-all for MoE) links the torch of the vLLM
+# image: its extension is named after the torch minor (nixl_ep_cpp_torch214)
+# and only that torch can import it. Keep TORCH_VERSION/TORCH_INDEX equal to
+# the VLLM_IMAGE's torch; the final stage fails the build if they drift. Only
+# headers and libraries are needed, so no --deps (no nvidia-* wheels), just the
+# python modules `import torch` needs for meson's probe.
+ARG TORCH_VERSION=2.14.0
+ARG TORCH_INDEX=cu130
+RUN uv pip install --system --no-deps \
+        --index-url "https://download.pytorch.org/whl/${TORCH_INDEX}" \
+        "torch==${TORCH_VERSION}" \
+    && uv pip install --system typing_extensions sympy filelock jinja2 networkx fsspec \
+    && python3 -c "import torch; print('nixl_ep builds against torch', torch.__version__)"
+
+# nixl backend wheel (nixl_cu13) with nixl_ep_cu13: inject the meson setup
+# args into pyproject.toml, rename the wheel, and build without isolation.
+# Skip the build-requires check, whose torch pin is satisfied above. With
+# build_nixl_ep, NIXL's CUDA targets default to sm_90 and newer.
 RUN set -e; \
-    sed -i 's|^setup = \["-Dinstall_headers=false"\]$|setup = ["-Dinstall_headers=false", "-Ducx_path=/usr", "-Denable_plugins=UCX,OBJ,REST"]|' pyproject.toml; \
-    grep -q '"-Denable_plugins=UCX,OBJ,REST"' pyproject.toml \
+    sed -i 's|^setup = \["-Dinstall_headers=false"\]$|setup = ["-Dinstall_headers=false", "-Ducx_path=/usr", "-Denable_plugins=UCX,OBJ,REST", "-Dbuild_nixl_ep=true"]|' pyproject.toml; \
+    grep -q '"-Dbuild_nixl_ep=true"' pyproject.toml \
         || { echo "ERROR: pyproject.toml sed patch failed" >&2; exit 1; }; \
     CUDA_MAJOR=$(echo "${CUDA_VERSION}" | cut -d. -f1) \
     && ./contrib/tomlutil.py --wheel-name "nixl-cu${CUDA_MAJOR}" pyproject.toml \
     && python3 -m build --wheel --no-isolation --skip-dependency-check . \
-    && cp dist/nixl[-_]cu${CUDA_MAJOR}-*.whl /wheels/
+    && W="$(ls dist/nixl[-_]cu${CUDA_MAJOR}-*.whl)" \
+    && { python3 -m zipfile -l "$W" | grep -q "nixl_ep_cu${CUDA_MAJOR}/nixl_ep_cpp_torch" \
+        || { echo "ERROR: $W has no nixl_ep_cu${CUDA_MAJOR} extension" >&2; exit 1; }; } \
+    && cp "$W" /wheels/
 
 # modelexpress python client wheel. --no-deps at install time neutralizes the
 # nixl[cu12]/torch pins; the optional vmm _alloc_ext builds with g++ and its
@@ -144,6 +161,18 @@ RUN uv pip install --system --no-deps \
         /wheels/nixl[-_]cu13-*.whl \
         /wheels/modelexpress-*.whl \
     && rm -rf /wheels
+
+# nixl_ep_cu13 must match this image's torch (see TORCH_VERSION in stage 1),
+# and resolve every library but libcuda.so.1, which GPU nodes inject. Importing
+# it here would need that driver library, so check the file and its links.
+RUN set -e; \
+    TV="$(python3 -c "import torch; print(''.join(torch.__version__.split('.')[:2]))")"; \
+    EP="$(python3 -c "import importlib.util, os; print(os.path.dirname(importlib.util.find_spec('nixl_ep_cu13').origin))")"; \
+    SO="$(ls "$EP"/nixl_ep_cpp_torch"${TV}".*.so 2>/dev/null | head -1)"; \
+    [ -n "$SO" ] || { echo "ERROR: no nixl_ep extension for torch ${TV} in $EP: $(ls "$EP")" >&2; exit 1; }; \
+    MISSING="$(ldd "$SO" | grep 'not found' | grep -v 'libcuda.so.1' || true)"; \
+    [ -z "$MISSING" ] || { echo "ERROR: $SO misses: $MISSING" >&2; exit 1; }; \
+    echo "nixl_ep_cu13 OK: $(basename "$SO")"
 
 # modelexpress ships p2p stubs generated for protobuf 5, which the base image's
 # protobuf (6 or 7, which vLLM's tracing needs) rejects. Regenerate them with
