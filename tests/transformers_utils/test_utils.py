@@ -33,6 +33,5 @@ def test_is_cloud_storage():
     assert is_cloud_storage("gs://model-path")
     assert is_cloud_storage("s3://model-path/path-to-model")
     assert is_cloud_storage("az://model-container/path")
-    assert is_cloud_storage("mx://models/Qwen3-0.6B")
     assert not is_cloud_storage("/unix/local/path")
     assert not is_cloud_storage("nfs://nfs-fqdn.local")

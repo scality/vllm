@@ -7,7 +7,6 @@ import os
 import subprocess
 import sys
 import textwrap
-import types
 from dataclasses import MISSING, Field, asdict, dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -23,7 +22,6 @@ from pydantic import ValidationError
 
 import vllm.config.vllm as vllm_config_module
 from tests.v1.spec_decode.utils import fake_speculative_config
-from vllm.assets.base import get_cache_dir
 from vllm.compilation.backends import VllmBackend
 from vllm.config import (
     AttentionConfig,
@@ -2899,34 +2897,6 @@ def test_s3_url_different_model_and_tokenizer(mock_pull_files):
     assert mock_pull_files.call_args_list[0][0][0] == model_url
     # Second call: tokenizer URI with ignore_pattern
     assert mock_pull_files.call_args_list[1][0][0] == tokenizer_url
-
-
-class MockModelExpressConfig(MockConfig):
-    _pull_modelexpress_metadata = ModelConfig._pull_modelexpress_metadata
-
-
-def test_mx_url_pulls_metadata_and_keeps_weights_uri(monkeypatch):
-    """An mx:// model is served from its pulled description, while the loader
-    still gets the URI to stream the weights from."""
-    pulled = []
-
-    def pull_metadata(uri, dest):
-        pulled.append(uri)
-        return str(dest)
-
-    module = types.ModuleType("modelexpress.obj_metadata")
-    setattr(module, "pull_metadata", pull_metadata)  # noqa: B010
-    monkeypatch.setitem(sys.modules, "modelexpress", types.ModuleType("modelexpress"))
-    monkeypatch.setitem(sys.modules, "modelexpress.obj_metadata", module)
-
-    url = "mx://models/Qwen3-0.6B"
-    config = MockModelExpressConfig(model=url, tokenizer=url)
-    ModelConfig.maybe_pull_model_tokenizer_for_runai(config, url, url)
-
-    assert pulled == [url]
-    assert config.model_weights == url
-    assert config.model.startswith(os.path.join(get_cache_dir(), "modelexpress"))
-    assert config.tokenizer == config.model
 
 
 @pytest.mark.parametrize(

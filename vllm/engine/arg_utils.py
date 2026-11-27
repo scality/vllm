@@ -5,6 +5,7 @@ import argparse
 import copy
 import dataclasses
 import functools
+import hashlib
 import json
 import os
 import sys
@@ -34,6 +35,7 @@ from pydantic.fields import FieldInfo
 from typing_extensions import TypeIs
 
 import vllm.envs as envs
+from vllm.assets.base import get_cache_dir
 from vllm.config import (
     AttentionConfig,
     AuxOutputConfig,
@@ -936,6 +938,7 @@ class EngineArgs:
         from vllm.plugins import load_general_plugins
 
         load_general_plugins()
+        self._maybe_pull_modelexpress_metadata()
         # when use hf offline,replace model and tokenizer id to local model path
         if huggingface_hub.constants.HF_HUB_OFFLINE:
             # Skip cloud storage URIs (s3://, gs://, az://) — they are not
@@ -2009,6 +2012,55 @@ class EngineArgs:
             **{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
         )
         return engine_args
+
+    def _maybe_pull_modelexpress_metadata(self) -> None:
+        """Serve a model whose description ModelExpress keeps on its object store.
+
+        With the ModelExpress load format and ``MX_OBJ_PARAMS`` set, look for a
+        manifest under ``MX_OBJ_URI``, or under the model's name. If there is
+        one, pull everything but the weights into the cache directory and load
+        from there, keeping the model's name as the served name; the weights
+        stream from the same prefix, which ``MX_OBJ_URI`` hands to the workers
+        (``model_weights`` would make MTP drafts read the model by name). This
+        runs before anything reads the model from the Hugging Face Hub. Without
+        a manifest, nothing changes.
+        """
+        if (
+            self.load_format not in ("modelexpress", "mx")
+            or self.model_weights
+            or not os.environ.get("MX_OBJ_PARAMS")
+            or os.path.exists(self.model)
+        ):
+            return
+        try:
+            from modelexpress.obj_metadata import (
+                ManifestNotFound,
+                object_prefix,
+                pull_metadata,
+            )
+        except ImportError:
+            return
+
+        prefix = object_prefix(self.model)
+        digest = hashlib.sha256(prefix.encode()).hexdigest()[:8]
+        dest = os.path.join(get_cache_dir(), "modelexpress", digest)
+        try:
+            path = pull_metadata(prefix, dest)
+        except ManifestNotFound:
+            logger.info(
+                "No ModelExpress manifest under %s; loading the description of %s "
+                "as usual",
+                prefix,
+                self.model,
+            )
+            return
+        logger.info("Loading %s from the object store prefix %s", self.model, prefix)
+        if self.served_model_name is None:
+            self.served_model_name = self.model
+        if self.tokenizer is None or self.tokenizer == self.model:
+            self.tokenizer = path
+        self.model = path
+        os.environ["MX_OBJ_URI"] = prefix
 
     def create_model_config(self) -> ModelConfig:
         if not envs.VLLM_ENABLE_V1_MULTIPROCESSING:

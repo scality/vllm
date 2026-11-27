@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import os
+import sys
+import types
 from argparse import ArgumentError
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
@@ -901,6 +904,53 @@ def test_cloud_storage_uri_skips_get_model_path(uri, monkeypatch):
     args = EngineArgs(model=uri)
     # model should remain the original cloud URI, not raise
     assert args.model == uri
+
+
+@pytest.fixture
+def modelexpress_store(monkeypatch, tmp_path):
+    """A stand-in for ModelExpress whose object store holds `org/model`."""
+    module = types.ModuleType("modelexpress.obj_metadata")
+
+    class ManifestNotFound(RuntimeError):
+        pass
+
+    def pull_metadata(prefix, dest):
+        if prefix != "org/model":
+            raise ManifestNotFound(prefix)
+        os.makedirs(dest, exist_ok=True)
+        return str(dest)
+
+    module.ManifestNotFound = ManifestNotFound  # type: ignore[attr-defined]
+    module.object_prefix = lambda model: os.environ.get("MX_OBJ_URI") or model  # type: ignore[attr-defined]
+    module.pull_metadata = pull_metadata  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "modelexpress", types.ModuleType("modelexpress"))
+    monkeypatch.setitem(sys.modules, "modelexpress.obj_metadata", module)
+    monkeypatch.setenv("MX_OBJ_PARAMS", '{"endpoint_override": "http://ring/models"}')
+    # Recorded so teardown removes the MX_OBJ_URI the hook sets.
+    monkeypatch.setenv("MX_OBJ_URI", "")
+    monkeypatch.delenv("MX_OBJ_URI")
+    monkeypatch.setattr("vllm.engine.arg_utils.get_cache_dir", lambda: str(tmp_path))
+
+
+def test_modelexpress_model_is_served_from_its_pulled_description(
+    modelexpress_store,
+):
+    """A model ModelExpress keeps on its object store is read from the pulled
+    description, never from the Hub, and keeps its name for clients."""
+    args = EngineArgs(model="org/model", load_format="modelexpress")
+
+    assert os.path.isdir(args.model)
+    assert args.tokenizer == args.model
+    assert args.served_model_name == "org/model"
+    assert os.environ["MX_OBJ_URI"] == "org/model"
+
+
+def test_modelexpress_model_without_manifest_is_left_alone(modelexpress_store):
+    args = EngineArgs(model="org/other", load_format="modelexpress")
+
+    assert args.model == "org/other"
+    assert args.served_model_name is None
+    assert "MX_OBJ_URI" not in os.environ
 
 
 def test_cloud_storage_tokenizer_skips_get_model_path(monkeypatch):
