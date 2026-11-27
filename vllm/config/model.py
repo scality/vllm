@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import hashlib
+import os
 from collections.abc import Callable
 from dataclasses import InitVar, field
 from functools import cached_property
@@ -10,6 +12,7 @@ import torch
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
 import vllm.envs as envs
+from vllm.assets.base import get_cache_dir
 from vllm.config.model_arch import (
     ModelArchitectureConfig,
 )
@@ -55,7 +58,7 @@ from vllm.transformers_utils.model_arch_config_convertor import (
 )
 from vllm.transformers_utils.repo_utils import resolve_revision
 from vllm.transformers_utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
-from vllm.transformers_utils.utils import maybe_model_redirect
+from vllm.transformers_utils.utils import is_modelexpress, maybe_model_redirect
 from vllm.utils.import_utils import LazyLoader
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -1234,6 +1237,10 @@ class ModelConfig:
         if self.model_weights:
             return
 
+        if is_modelexpress(model) or is_modelexpress(tokenizer):
+            self._pull_modelexpress_metadata(model, tokenizer)
+            return
+
         if not (is_runai_obj_uri(model) or is_runai_obj_uri(tokenizer)):
             return
 
@@ -1268,6 +1275,31 @@ class ModelConfig:
                 ignore_pattern=["*.pt", "*.safetensors", "*.bin", "*.tensors", "*.pth"],
             )
             self.tokenizer = object_storage_tokenizer.dir
+
+    def _pull_modelexpress_metadata(self, model: str, tokenizer: str) -> None:
+        """Pull the non-weight files of `mx://` models into the cache directory.
+
+        The weights stay on the object store: `model_weights` keeps the URI for
+        the ModelExpress loader to stream them from.
+        """
+        try:
+            from modelexpress.obj_metadata import pull_metadata
+        except ImportError as e:
+            raise ImportError(
+                "Loading an mx:// model requires the ModelExpress Python package."
+            ) from e
+
+        def pull(uri: str) -> str:
+            digest = hashlib.sha256(uri.encode()).hexdigest()[:8]
+            return pull_metadata(
+                uri, os.path.join(get_cache_dir(), "modelexpress", digest)
+            )
+
+        if is_modelexpress(model):
+            self.model_weights = model
+            self.model = pull(model)
+        if is_modelexpress(tokenizer):
+            self.tokenizer = self.model if tokenizer == model else pull(tokenizer)
 
     def _get_encoder_config(self) -> dict[str, Any] | None:
         return get_sentence_transformer_tokenizer_config(self.model, self.revision)

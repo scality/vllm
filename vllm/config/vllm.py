@@ -23,6 +23,7 @@ import vllm.envs as envs
 from vllm.logger import enable_trace_function_call, init_logger
 from vllm.platforms import current_platform
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
+from vllm.transformers_utils.utils import is_modelexpress
 from vllm.utils import random_uuid
 from vllm.utils.math_utils import cdiv
 
@@ -2853,7 +2854,21 @@ class VllmConfig:
 
             SequenceClassificationConfig.verify_and_update_config(self)
 
-        if hasattr(self.model_config, "model_weights") and is_runai_obj_uri(
+        if hasattr(self.model_config, "model_weights") and is_modelexpress(
+            self.model_config.model_weights
+        ):
+            if self.load_config.load_format == "auto":
+                logger.info(
+                    "Detected an mx:// model. Overriding `load_format` to "
+                    "'modelexpress'"
+                )
+                self.load_config.load_format = "modelexpress"
+            elif self.load_config.load_format not in ("modelexpress", "mx"):
+                raise ValueError(
+                    "To load an mx:// model, 'load_format' must be 'modelexpress', "
+                    f"but got '{self.load_config.load_format}'."
+                )
+        elif hasattr(self.model_config, "model_weights") and is_runai_obj_uri(
             self.model_config.model_weights
         ):
             if self.load_config.load_format == "auto":
