@@ -21,7 +21,7 @@ on:
         default: v1.6.0-scality.1
       modelexpress_ref:
         description: "scality/modelexpress branch, tag or SHA"
-        default: v0.5.0-scality.2
+        default: v0.5.0-scality.3
       rebuild_deps:
         description: "Rebuild nixl-deps even if its tag already exists"
         type: boolean
@@ -38,7 +38,7 @@ concurrency:
 env:
   REGISTRY: ghcr.io/scality
   NIXL_REF: ${{ inputs.nixl_ref || 'v1.6.0-scality.1' }}
-  MX_REF: ${{ inputs.modelexpress_ref || 'v0.5.0-scality.2' }}
+  MX_REF: ${{ inputs.modelexpress_ref || 'v0.5.0-scality.3' }}
 
 jobs:
   nixl-deps:
